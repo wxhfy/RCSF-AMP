@@ -136,6 +136,12 @@ class GraphConstructor:
             # 不再添加 activity_label 字段，只保留 y 字段
 
 
+
+            # 验证 y 字段是否存在
+            if not hasattr(data, 'y') or data.y is None:
+                logger.error(f"Data对象缺少y字段，终止构建: {sequence_id}")
+                raise RuntimeError(f"Data对象缺少y字段: {sequence_id}")
+
             return data
 
         except Exception as e:
