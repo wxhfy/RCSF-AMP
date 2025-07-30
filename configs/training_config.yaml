@@ -1,0 +1,159 @@
+checkpointing:
+  mode: max
+  monitor: val_mcc
+  save_best_only: false
+  save_top_k: 3
+common_training:
+  dynamic_weights_log_interval: 1
+  gradient_clip_norm: 1.0
+  gradient_norm_type: 2.0
+  log_interval: 10
+  save_interval: 5
+  seed: 42
+  val_interval: 1
+experiment:
+  description: SUCF with Mamba - 两阶段训练，结构图谱引导序列精炼
+  name: sucf_best_structure
+  tags:
+  - sucf
+  - mamba
+  - multimodal
+  - amp
+  - two-stage
+  version: '5.0'
+inference:
+  optimal_threshold: 0.57
+  threshold_optimization_metric: mcc
+  threshold_optimization_score: 0.9269
+logging:
+  log_level: INFO
+  tensorboard: true
+  wandb: false
+model:
+  architecture:
+    cross_attention_heads: 16
+    dropout: 0.15000000000000002
+    edge_scalar_dim: 10
+    gvp_layers: 1
+    hidden_dim: 512
+    laplacian_k: 16
+    mamba_d_conv: 8
+    mamba_d_state: 32
+    mamba_expand: 4
+    mamba_layers: 2
+    node_scalar_dim: 22
+    node_vector_dim: 1
+    rgat_heads: 16
+    rgat_layers: 2
+  esm:
+    base_model_name_or_path: facebook/esm2_t36_3B_UR50D
+    lora_fallback_to_base: true
+    lora_inference_mode: true
+    output_dim: 2560
+    repr_layer: 36
+    use_lora: false
+  type: SGGNet
+paths:
+  checkpoint_dir: ./best_structure_config0/checkpoints
+  data_root: /home/20T-1/fyh0106/compare/merged_amp_decoy
+  log_dir: ./best_structure_config0/logs
+training:
+  batch_size: 32
+  early_stopping_patience: 6
+  evaluation:
+    dynamic_threshold:
+      enabled: false
+      log_search_details: true
+      optimization_metric: mcc
+      search_range:
+        max_threshold: 0.99
+        min_threshold: 0.01
+        search_steps: 100
+      start_epoch: 5
+      update_frequency: 5
+      validation_based: true
+    threshold: 0.5
+    threshold_optimization:
+      enabled: true
+      max_threshold: 0.99
+      metric: mcc
+      min_threshold: 0.01
+      num_thresholds: 99
+  loss_config:
+    alignment_contrastive_temperature: 0.1
+    gating_regularization:
+      alpha: 0.05
+      enable: true
+      target_entropy: 0.5
+    label_smoothing: 0.2
+    supervised_contrastive_temperature: 0.05189093462257077
+  model_regularization:
+    fusion_attention_dropout: 0.1
+    fusion_dropout: 0.25
+    gat_dropout: 0.2
+    gat_edge_dropout: 0.15
+    global_dropout: 0.2
+    prediction_head_dropout: 0.35
+  num_workers: 16
+  optimizer_params:
+    betas:
+    - 0.9
+    - 0.999
+    eps: 1.0e-08
+    type: AdamW
+    weight_decay: 0.030287309815754185
+  pin_memory: true
+  scheduler_params:
+    T_max: 50
+    min_lr_factor: 0.01
+    scheduler_type: cosine_annealing
+    warmup_epochs: 3
+  sub_stages:
+    '1.0':
+      active_losses:
+      - alignment_contrastive
+      description: 强制序列和结构编码器相互对齐
+      early_stopping:
+        enable: true
+        min_delta: 0.001
+        mode: min
+        monitor: val_loss
+        patience: 5
+      epochs: 15
+      learning_rates:
+        default: 2.269895446425692e-05
+      loss_weights:
+        activity: 0.0
+        alignment_contrastive: 1.0
+        supervised_contrastive: 0.0
+      name: Feature Alignment Pre-training
+    '2.0':
+      active_losses:
+      - activity
+      - supervised_contrastive
+      description: 在对齐的基础上，专注于优化融合模块和预测性能
+      early_stopping:
+        enable: true
+        min_delta: 0.001
+        mode: max
+        monitor: val_mcc
+        patience: 7
+      epochs: 35
+      learning_rates:
+        default: 1.6846607669279043e-05
+      loss_weights:
+        activity: 1.0
+        alignment_contrastive: 0.010362460530537325
+        supervised_contrastive: 0.458941863360756
+      name: SGG-Net-Mamba Fine-tuning
+  temperature_config:
+    annealing_frequency: 10
+    annealing_start_epoch: 20
+    enable_temperature_annealing: true
+    fusion_temperature: 1.0
+    rgatv3_temperature: 1.2
+    temperature_annealing_factor: 0.98
+  weight_constraints:
+    dynamic_weight_start_stage: 1.0
+    enable: true
+    entropy_weight: 0.05
