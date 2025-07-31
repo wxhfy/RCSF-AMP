@@ -22,7 +22,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 from models.sucf_model import create_sucf_model
-from training.sucf_losses import create_sucf_loss_function
+from utils.sucf_losses import create_sucf_loss_function
 from utils.metrics import calculate_metrics
 from utils.early_stopping import EarlyStopping
 from utils.config_utils import load_config, validate_config, get_evaluation_threshold

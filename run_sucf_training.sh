@@ -1,1 +1,0 @@
-python training/train_sucf.py --config configs/training_config.yaml --test-mode
