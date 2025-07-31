@@ -33,7 +33,6 @@ class GraphConstructor:
         self.pdb_processor = PDBProcessor()
         self.feature_calculator = FeatureCalculator(
             cutoff_distance=cutoff_distance,
-            max_seq_sep=max_seq_sep
         )
         # logger.info(f"GraphConstructor 初始化完毕，空间边截断距离: {cutoff_distance} Å")
 
