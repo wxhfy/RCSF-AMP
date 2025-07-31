@@ -286,7 +286,8 @@ if __name__ == "__main__":
             mp.set_start_method("fork", force=True)
     except (ValueError, RuntimeError):
         logger.info("Fork start method not available, using default.")
-
+    import math
+    
     parser = argparse.ArgumentParser(description="AMP data preprocessing utility")
     parser.add_argument("--output_dir", type=str, required=True, help="Root directory to save all processed data.")
     parser.add_argument("--data_root", type=str, required=True, help="Root directory of the input PDB files.")
@@ -294,7 +295,7 @@ if __name__ == "__main__":
     parser.add_argument("--cutoff", type=float, default=10.0, help="Distance cutoff for graph construction (Å).")
     parser.add_argument("--esm_model_name", type=str, default="facebook/esm2_t36_3B_UR50D", help="ESM model name.")
     parser.add_argument("--esm_model_base_path", type=str, help="Local root directory for the ESM model.")
-    parser.add_argument("--max_seq_len", type=int, default=500, help="Maximum sequence length to process.")
+    parser.add_argument("--max_seq_len", type=int, default=math.inf, help="Maximum sequence length to process.")
     parser.add_argument("--force_regenerate_embeddings", action="store_true", help="Force re-computation of all ESM embeddings.")
     parser.add_argument("--force_regenerate_graphs", action="store_true", help="Force re-construction of all graph files.")
     parser.add_argument("--skip_embeddings", action="store_true", help="Skip the ESM embedding computation step.")
