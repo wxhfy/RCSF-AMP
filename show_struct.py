@@ -5,8 +5,8 @@ import torch
 # pt_path = "/home/20T-1/fyh0106/compare2/merged_amp_decoy/checkpoints/no_mamba/best_2.0.pth"
 # pt_path = "/home/20T-1/fyh0106/compare2/merged_amp_decoy/checkpoints/no_plddt/best_2.0.pth"
 # pt_path = "/home/20T-1/fyh0106/compare2/merged_amp_decoy/graphs/test_042L_FRG3G.pt"
-# pt_path = "/home/fyh0106/SUCF/benchmark1_graph/graphs/AP00001.pt"
-pt_path = "/home/fyh0106/SUCF/benchmark2_graph/graphs/2B_TAV.pt"
+pt_path = "/home/fyh0106/SUCF/benchmark1_graph/graphs/AP00001.pt"
+# pt_path = "/home/fyh0106/SUCF/benchmark2_graph/graphs/2B_TAV.pt"
 # pt_path = "/home/20T-1/fyh0106/compare/merged_amp_decoy/graphs/test_AP00001.pt"
 ckpt = torch.load(pt_path, map_location="cpu")
 

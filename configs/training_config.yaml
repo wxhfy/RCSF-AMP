@@ -55,7 +55,7 @@ model:
   type: SGGNet
 paths:
   checkpoint_dir: ./best_structure_config0/checkpoints
-  data_root: /home/20T-1/fyh0106/compare/merged_amp_decoy
+  data_root: /home/fyh0106/SUCF/benchmark1_graph
   log_dir: ./best_structure_config0/logs
 training:
   batch_size: 32

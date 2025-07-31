@@ -2,8 +2,6 @@
 # -*- coding: utf-8 -*-
 import argparse
 import json
-import os
-from multiprocessing import cpu_count  #
 
 import torch
 import numpy as np
@@ -13,59 +11,35 @@ import logging
 
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
-from peft import PeftModel  # Added for LoRA #
 from torch.cuda.amp import autocast
 import sys
 logger = logging.getLogger(__name__)
 
 
-# 为了更好地调试多进程，可以在日志格式中加入进程ID
-# logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s:%(levelname)s:%(process)d] %(message)s")
-
-
-class _SequenceDataset(torch.utils.data.Dataset):
-    """用于ESM序列嵌入的内部PyTorch数据集类。"""
-
-    def __init__(self, sequence_ids: List[str], sequences: List[str]):
-        if len(sequence_ids) != len(sequences):
-            raise ValueError("序列ID列表和序列列表的长度必须一致。")
-        self.sequence_ids = sequence_ids
-        self.sequences = sequences
-
-    def __len__(self) -> int:
-        return len(self.sequences)
-
-    def __getitem__(self, idx: int) -> Tuple[str, str]:
-        return self.sequence_ids[idx], self.sequences[idx]
-
-
 class ESMEmbedder:
     """
-    使用Transformers库加载的ESM模型计算蛋白质序列嵌入的类。
-    支持从本地路径加载基础模型并应用LoRA adapter。
+    Compute protein sequence embeddings using ESM models from HuggingFace Transformers.
     """
 
     def __init__(self,
                  model_name: str = "facebook/esm2_t36_3B_UR50D",
                  local_model_path_root: Optional[str] = None,
                  device: Union[str, torch.device] = None,
-                 lora_weights_path: Optional[str] = None,
                  repr_layer: Optional[int] = 36,
                  include_bos_eos: bool = False,
                  max_sequence_length: int = 1022
                  ):
         self.model_hub_name_original = model_name
-        # 强制优先使用GPU
+        # Use GPU if available, otherwise fallback to CPU
         if device is not None:
             self.device = torch.device(device)
         else:
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.lora_weights_path = lora_weights_path
         self.repr_layer_index = repr_layer
         self.include_bos_eos = include_bos_eos
         self.max_sequence_length = max_sequence_length
 
-        # 仅保留必要的错误日志
+        # Load base ESM model from HuggingFace or local path
         base_model_load_path = model_name
         if local_model_path_root:
             resolved_local_path = Path(local_model_path_root).resolve()
@@ -78,25 +52,7 @@ class ESMEmbedder:
             if Path(base_model_load_path).is_dir() and (Path(base_model_load_path) / "pytorch_model.bin").exists() or \
                     Path(base_model_load_path).is_dir() and list(Path(base_model_load_path).glob("*.safetensors")):
                 pass
-            base_model_for_peft = AutoModel.from_pretrained(base_model_load_path, **load_kwargs)
-            use_lora = False
-            if self.lora_weights_path and self.lora_weights_path.lower() not in ['null', 'none', '']:
-                resolved_lora_path = Path(self.lora_weights_path).resolve()
-                if resolved_lora_path.is_dir():
-                    adapter_config_file = resolved_lora_path / "adapter_config.json"
-                    if adapter_config_file.exists() and adapter_config_file.is_file():
-                        try:
-                            self.model = PeftModel.from_pretrained(base_model_for_peft, str(resolved_lora_path))
-                            use_lora = True
-                        except Exception as e_peft:
-                            logger.error(f"ESMEmbedder: 应用LoRA adapter '{resolved_lora_path}' 失败: {e_peft}")
-                            self.model = base_model_for_peft
-                    else:
-                        self.model = base_model_for_peft
-                else:
-                    self.model = base_model_for_peft
-            else:
-                self.model = base_model_for_peft
+            self.model = AutoModel.from_pretrained(base_model_load_path, **load_kwargs)
             self.model.to(self.device)
             self.model.eval()
             effective_config = None
@@ -105,7 +61,7 @@ class ESMEmbedder:
                     effective_config = self.model.get_base_model().config
                 elif hasattr(self.model, 'config'):
                     effective_config = self.model.config
-            except Exception as e_config:
+            except Exception:
                 pass
             num_model_layers = -1
             if effective_config and hasattr(effective_config, 'num_hidden_layers'):
@@ -127,7 +83,6 @@ class ESMEmbedder:
             elif not (0 <= self.repr_layer_index <= num_model_layers):
                 self.repr_layer_index = num_model_layers
         except Exception as e_init:
-            logger.error(f"ESMEmbedder: 初始化模型或Tokenizer时发生严重错误: {e_init}", exc_info=True)
             raise
 
         try:
@@ -150,55 +105,11 @@ class ESMEmbedder:
             base_model_for_peft = AutoModel.from_pretrained(base_model_load_path, **load_kwargs)
             logger.info(f"ESMEmbedder: 基础模型 {base_model_load_path} 加载成功。类型: {type(base_model_for_peft)}")
 
-            # 应用LoRA adapter（支持条件性使用）
-            use_lora = False
-            if self.lora_weights_path and self.lora_weights_path.lower() not in ['null', 'none', '']:
-                resolved_lora_path = Path(self.lora_weights_path).resolve()
-                
-                if resolved_lora_path.is_dir():
-                    adapter_config_file = resolved_lora_path / "adapter_config.json"
-                    if adapter_config_file.exists() and adapter_config_file.is_file():
-                        try:
-                            # 加载LoRA时，基础模型应已在期望的dtype
-                            logger.info(f"ESMEmbedder: 正在应用LoRA adapter: {resolved_lora_path}")
-                            self.model = PeftModel.from_pretrained(base_model_for_peft, str(resolved_lora_path))
-                            use_lora = True
-                            logger.info("ESMEmbedder: LoRA adapter应用成功！")
-                        except Exception as e_peft:
-                            logger.error(f"ESMEmbedder: 应用LoRA adapter '{resolved_lora_path}' 失败: {e_peft}")
-                            logger.warning("ESMEmbedder: 将回退到使用没有LoRA的基础模型。")
-                            self.model = base_model_for_peft
-                    else:
-                        logger.warning(
-                            f"ESMEmbedder: LoRA adapter路径 '{resolved_lora_path}' 中未找到 'adapter_config.json' 文件。"
-                            "请确保路径正确且adapter已正确保存。将使用没有LoRA的基础模型。"
-                        )
-                        self.model = base_model_for_peft
-                else:
-                    logger.warning(
-                        f"ESMEmbedder: 提供的LoRA adapter路径 '{self.lora_weights_path}' (resolved: {resolved_lora_path}) "
-                        "不是一个有效的目录。将使用没有LoRA的基础模型。"
-                    )
-                    self.model = base_model_for_peft
-            else:
-                logger.info("ESMEmbedder: 未提供有效的LoRA权重路径，将使用原始基础模型。")
-                self.model = base_model_for_peft
 
             self.model.to(self.device)
             self.model.eval()
             logger.info(f"ESMEmbedder: 最终模型已移至 {self.device} 并设置为评估模式。")
             
-            # 打印详细的模型信息
-            logger.info("=" * 60)
-            logger.info("ESM2 模型配置信息:")
-            logger.info(f"  基础模型路径: {base_model_load_path}")
-            logger.info(f"  是否为本地模型: {Path(base_model_load_path).is_dir()}")
-            logger.info(f"  使用LoRA适配器: {'是' if use_lora else '否'}")
-            if use_lora:
-                logger.info(f"  LoRA适配器路径: {self.lora_weights_path}")
-            logger.info(f"  模型类型: {type(self.model).__name__}")
-            logger.info(f"  设备: {self.device}")
-            logger.info(f"  数据类型: {model_dtype}")
             
             # 获取模型参数信息
             try:
@@ -235,19 +146,6 @@ class ESMEmbedder:
                     "esm2_t12_35M_UR50D": 12, "esm2_t6_8M_UR50D": 6
                 }
                 model_key_part = self.model_hub_name_original.split('/')[-1]
-                guessed_layers = known_esm_layers.get(model_key_part)
-
-                if guessed_layers:
-                    num_model_layers = guessed_layers
-                    logger.warning(
-                        f"ESMEmbedder: 无法从模型配置 ({type(self.model)}) 中可靠地获取num_hidden_layers。 "
-                        f"基于模型名称 '{self.model_hub_name_original}' 猜测为: {num_model_layers} 层。"
-                    )
-                else:  # Final fallback
-                    num_model_layers = 36  # Default for common large ESM
-                    logger.error(
-                        f"ESMEmbedder: 无法确定模型的层数。将默认使用 {num_model_layers} 层。这可能不正确！"
-                    )
 
             # hidden_states 返回的元组长度是 num_model_layers + 1 (0是输入嵌入, 1 to num_model_layers 是transformer层输出)
             # 所以有效的索引是 0 到 num_model_layers
@@ -284,14 +182,13 @@ class ESMEmbedder:
             elif isinstance(item, dict) and "id" in item and "sequence" in item:
                 processed_batch_data.append((item["id"], item["sequence"]))
             else:
-                logger.warning(f"ESMEmbedder: 跳过格式不正确的序列数据项: {item}")
                 continue
 
         if not processed_batch_data:
             return {}
 
         batch_strs = [seq_str for _, seq_str in processed_batch_data]
-        # tokenizer.num_special_tokens_to_add(pair=False) 通常是2 (BOS, EOS)
+        # Add special tokens (BOS/EOS) if required by tokenizer
         tokenizer_max_len = self.max_sequence_length + self.tokenizer.num_special_tokens_to_add(pair=False)
 
         inputs = self.tokenizer(
@@ -304,40 +201,29 @@ class ESMEmbedder:
 
         batch_embeddings = {}
         with torch.no_grad(), autocast(enabled=(
-                self.device.type == 'cuda' and self.model.dtype == torch.float16)):  # Autocast if model is fp16 on CUDA
+                self.device.type == 'cuda' and self.model.dtype == torch.float16)):
             outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
-
             if not hasattr(outputs, 'hidden_states') or outputs.hidden_states is None or not outputs.hidden_states:
-                logger.error("ESMEmbedder: 模型输出中未找到 'hidden_states'。")
                 if hasattr(outputs, 'last_hidden_state') and outputs.last_hidden_state is not None:
-                    logger.warning("ESMEmbedder: 使用 'last_hidden_state' 作为备选。")
                     token_representations = outputs.last_hidden_state
                 else:
-                    logger.error("ESMEmbedder: 模型输出中也未找到 'last_hidden_state'。无法提取嵌入。")
                     for seq_id, _ in processed_batch_data:
-                        batch_embeddings[seq_id] = np.array([], dtype=np.float32)  # 返回空数组表示失败
-                    return batch_embeddings  # 提前返回，因为无法提取表示
+                        batch_embeddings[seq_id] = np.array([], dtype=np.float32)
+                    return batch_embeddings
             else:
-                # self.repr_layer_index 已在 __init__ 中验证并设置为有效值
                 token_representations = outputs.hidden_states[self.repr_layer_index]
 
             for i, (seq_id, original_seq_str) in enumerate(processed_batch_data):
                 true_len_with_special_tokens = inputs['attention_mask'][i].sum().item()
 
                 if self.include_bos_eos:
-                    # 包含BOS和EOS (以及之间的所有tokens)
+                    # Use all tokens including BOS/EOS
                     embedding = token_representations[i, :true_len_with_special_tokens].cpu().numpy()
                 else:
-                    # 不包含BOS和EOS，只取氨基酸残基的表示
-                    # 假设BOS是第0个token, EOS是最后一个有效token (true_len_with_special_tokens - 1)
-                    # 氨基酸序列在 token_representations[i, 1 : true_len_with_special_tokens-1]
+                    # Use only amino acid tokens (exclude BOS/EOS)
                     start_idx = 1
                     end_idx = true_len_with_special_tokens - 1
-                    if start_idx >= end_idx:  # 例如，序列在截断后只剩下BOS和EOS或更少
-                        logger.warning(
-                            f"ESMEmbedder: 序列 {seq_id} (原始长度 {len(original_seq_str)}) 在移除BOS/EOS后没有剩余的残基表示 "
-                            f"(tokenized length with special tokens: {true_len_with_special_tokens})。返回空嵌入。"
-                        )
+                    if start_idx >= end_idx:
                         embedding = np.array([], dtype=np.float32)
                     else:
                         embedding = token_representations[i, start_idx:end_idx].cpu().numpy()
@@ -345,69 +231,7 @@ class ESMEmbedder:
         return batch_embeddings
 
 
-def _worker_process_embedding(args_tuple: Tuple) -> Optional[Dict[str, str]]:
-    worker_id, device_id_str, model_hub_name_param, local_model_dir_param, lora_path_param, \
-        layer_to_extract_param, include_special_tokens_param, seq_chunk_tuples_param, out_dir_param, BATCH_SIZE_GPU_param = args_tuple
 
-    # 为每个工作进程配置独立的日志记录器或使用主进程的（如果配置允许）
-    # logger = logging.getLogger(f"_worker_process_embedding_{worker_id}") # 可选：独立logger
-    # handler = logging.StreamHandler()
-    # formatter = logging.Formatter("%(asctime)s [%(name)s:%(levelname)s:%(process)d] %(message)s")
-    # handler.setFormatter(formatter)
-    # logger.addHandler(handler)
-    # logger.setLevel(logging.INFO) # 或者从主进程继承
-
-    logger.info(
-        f"Worker {worker_id} (PID {os.getpid()}) on device {device_id_str}: Starting, processing {len(seq_chunk_tuples_param)} sequences.")
-    saved_file_paths = {}  # type: Dict[str, Optional[str]]
-
-    try:
-        embedder_instance = ESMEmbedder(
-            model_name=model_hub_name_param,
-            local_model_path_root=local_model_dir_param,
-            device=device_id_str,
-            lora_weights_path=lora_path_param,
-            repr_layer=layer_to_extract_param,
-            include_bos_eos=include_special_tokens_param
-        )
-
-        num_batches_in_chunk = (len(seq_chunk_tuples_param) + BATCH_SIZE_GPU_param - 1) // BATCH_SIZE_GPU_param
-        # 为工作进程创建进度条
-        worker_pbar = tqdm(
-            total=len(seq_chunk_tuples_param),
-            desc=f"Worker {worker_id} (GPU {device_id_str})"
-        )
-
-        for batch_idx in range(num_batches_in_chunk):
-            batch_start = batch_idx * BATCH_SIZE_GPU_param
-            batch_end = min((batch_idx + 1) * BATCH_SIZE_GPU_param, len(seq_chunk_tuples_param))
-            batch_tuples = seq_chunk_tuples_param[batch_start:batch_end]
-            batch_embeddings = embedder_instance.embed_batch(batch_tuples)
-            for seq_id, embedding in batch_embeddings.items():
-                out_file = Path(out_dir_param) / f"{seq_id}.npy"
-                # 确保目录存在
-                out_file.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    np.save(out_file, embedding)
-                    saved_file_paths[seq_id] = str(out_file)
-                except Exception as e_save:
-                    logger.error(f"Worker {worker_id}: 保存序列 {seq_id} 的嵌入到 {out_file} 时出错: {e_save}")
-                    saved_file_paths[seq_id] = None
-            worker_pbar.update(len(batch_tuples))
-
-        worker_pbar.close()
-
-        logger.info(
-            f"Worker {worker_id} (PID {os.getpid()}) on device {device_id_str}: Finished. "
-            f"Successfully processed {len([p for p in saved_file_paths.values() if p is not None])} sequences in this chunk."
-        )
-        return saved_file_paths
-    except Exception as e_proc_init:
-        logger.error(
-            f"Worker {worker_id} (PID {os.getpid()}) on device {device_id_str}: CRITICAL ERROR during initialization or execution: {e_proc_init}",
-            exc_info=True)
-        failed_results = {seq_identifier: None for seq_identifier, _ in seq_chunk_tuples_param}
-        return failed_results
 
 
 def embed_sequences_multi_gpu(
@@ -415,12 +239,8 @@ def embed_sequences_multi_gpu(
     output_dir,
     model_name,
     local_model_path_root=None,
-    lora_weights_path=None,
     repr_layer=None,
     include_bos_eos=False,
-    batch_size_per_gpu=8,
-    gpu_ids=None,
-    num_workers=None
 ):
     """
     多GPU/多进程并行计算蛋白质序列嵌入，并保存为npy文件。
@@ -428,8 +248,7 @@ def embed_sequences_multi_gpu(
     from pathlib import Path
     import math
 
-    # 目录创建由主训练脚本负责，这里不再创建多余目录
-    # 预处理输入数据
+    # Preprocess input data; directory creation is handled by the main script
     sequences_to_process_tuples = []
     for item in sequence_data:
         if isinstance(item, dict) and "id" in item and "sequence" in item:
@@ -443,13 +262,12 @@ def embed_sequences_multi_gpu(
         logger.error("embed_sequences_multi_gpu: 没有可处理的序列。")
         return {}
 
-    # 只用单进程，强制使用cuda:0（如可用）
+    # Use single process, always prefer cuda:0 if available
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     embedder = ESMEmbedder(
         model_name=model_name,
         local_model_path_root=local_model_path_root,
         device=device,
-        lora_weights_path=lora_weights_path,
         repr_layer=repr_layer,
         include_bos_eos=include_bos_eos
     )
@@ -459,13 +277,11 @@ def embed_sequences_multi_gpu(
         embedding_dict = embedder.embed_batch([(seq_id, seq_str)])
         embedding = embedding_dict.get(seq_id, None)
         out_file = Path(output_dir) / f"{seq_id}.npy"
-        # 确保目录存在
         out_file.parent.mkdir(parents=True, exist_ok=True)
         try:
             np.save(out_file, embedding)
             final_saved_paths[seq_id] = str(out_file)
-        except Exception as e_save:
-            logger.error(f"保存序列 {seq_id} 的嵌入到 {out_file} 时出错: {e_save}")
+        except Exception:
             final_saved_paths[seq_id] = None
     return final_saved_paths
 

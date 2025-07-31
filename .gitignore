@@ -1,3 +1,6 @@
 benchmark1_graph/
 benchmark2_graph/
 *.pyc
+best_structure_config0/
+log*
+checkpoints*

@@ -516,7 +516,7 @@ if __name__ == "__main__":
     parser.add_argument("--cutoff", type=float, default=10.0, help="距离截断值 (Å)")
     parser.add_argument("--esm_model_name", type=str, default="facebook/esm2_t36_3B_UR50D", help="ESM模型名")
     parser.add_argument("--esm_model_base_path", type=str, help="ESM本地模型根目录")
-    parser.add_argument("--max_seq_len", type=int, default=500, help="提取序列的最大长度 (默认200)")
+    parser.add_argument("--max_seq_len", type=int, default=500, help="提取序列的最大长度 (默认500)")
     # 强制重新生成选项
     parser.add_argument("--force_regenerate_sequences", action="store_true", help="强制重新提取序列，即使JSON文件已存在。")
     parser.add_argument("--force_regenerate_embeddings", action="store_true", help="强制重新计算ESM嵌入，即使.npy文件已存在。")
