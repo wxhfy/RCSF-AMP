@@ -82,7 +82,7 @@ class AMPPreprocessor:
         """
         self.output_dir_base = output_dir
         self.graph_constructor = GraphConstructor(
-            cutoff_distance=cutoff_distance, max_seq_sep=max_seq_sep
+            cutoff_distance=cutoff_distance
         )
         self.pdb_processor = PDBProcessor()
         self.esm_model_name = esm_model_name
@@ -93,7 +93,7 @@ class AMPPreprocessor:
                            data_root: str,
                            benchmark_mode: str = "benchmark1",
                            pdb_file_type: str = "pdb.gz",
-                           num_workers: int = 16,
+                           num_workers: int = 32,
                            process_embeddings: bool = True,
                            force_regenerate_embeddings: bool = False,
                            force_regenerate_graphs: bool = False,
@@ -300,20 +300,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip_embeddings", action="store_true", help="Skip the ESM embedding computation step.")
     parser.add_argument("--num_workers", type=int, default=mp.cpu_count(), help="Number of CPU worker processes for graph construction.")
     parser.add_argument("--batch_size", type=int, default=500, help="Batch size for processing graphs to manage memory.")
-    parser.add_argument("--gpus_embed", type=str, default=None, help="GPU IDs for ESM embedding (e.g., '0,1').")
 
     args = parser.parse_args()
-
-    gpu_ids = None
-    if args.gpus_embed:
-        try:
-            gpu_ids = [int(gid.strip()) for gid in args.gpus_embed.split(',') if gid.strip()]
-            if not torch.cuda.is_available():
-                logger.warning("CUDA not available, ignoring specified GPU IDs.")
-                gpu_ids = None
-        except ValueError:
-            logger.error(f"Invalid GPU ID format: '{args.gpus_embed}'.")
-            sys.exit(1)
 
     preprocessor = AMPPreprocessor(
         output_dir=args.output_dir,

@@ -23,11 +23,10 @@ from tqdm import tqdm
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from models.sgg_net_model import create_sucf_model
+from models.sucf_model import create_sucf_model
 from training.sucf_losses import create_sucf_loss_function
 from utils.metrics import calculate_metrics
 from utils.early_stopping import EarlyStopping
-from utils.logging_utils import setup_logging
 from utils.config_utils import load_config, validate_config, get_evaluation_threshold
 
 
@@ -262,7 +261,6 @@ class SUCFTrainer:
         total_samples = 0
         all_predictions = []
         all_targets = []
-        epoch_metrics = {}
         
         # 获取阶段信息
         stage_info = {
@@ -673,7 +671,7 @@ class SUCFTrainer:
         return best_stage_metric
     
     def train(self, train_loader, val_loader, test_loader=None):
-        """完整的两阶段训练流程 - 简化版本"""
+        """完整的两阶段训练流程"""
         if self.is_main_process:
             logger.info("开始SGG-Net两阶段训练")
         

@@ -16,7 +16,7 @@ from .pooling_layers import GlobalPooling
 from .amp_multimodal_model import StructuralFeatureProjection, ActivityHead
 
 # 导入SGG-Net特有组件
-from .sgg_net_components import (
+from .sucf_components import (
     LaplacianPositionalEncoding, 
     GRUGate, 
     MambaLayer, 
