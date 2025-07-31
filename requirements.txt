@@ -71,9 +71,9 @@ kiwisolver==1.4.8
 llvmlite==0.44.0
 lxml==6.0.0
 Mako==1.3.10
-mamba-ssm @ file:///home/4T-1/fyh/tools/mamba_ssm-2.2.4%2Bcu11torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl#sha256=d73d6ad9216d13ee8acd447e8a9b22c39979e76e5c97a2008bc07a47cdc5e070
-Markdown @ file:///croot/markdown_1746114451035/work
-MarkupSafe @ file:///croot/markupsafe_1738584038848/work
+mamba-ssm==2.2.4
+Markdown==3.4.1
+MarkupSafe==2.1.3
 matplotlib==3.10.3
 matplotlib-inline==0.1.7
 mistune==3.1.3
