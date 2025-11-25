@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional
+from torch_geometric.nn import global_mean_pool
+from torch_geometric.utils import to_dense_batch
 
 
 class MultiHeadAttention(nn.Module):
@@ -152,23 +154,20 @@ class GlobalPooling(nn.Module):
                           - For single graph input: [d_model]
         """
         if x.dim() == 2 and batch is not None:
-            # Handle PyG sparse batch data by iterating through graphs.
-            # Note: This loop-based approach can be inefficient for batches with many small graphs.
-            num_graphs = batch.max().item() + 1
-            output_list = []
-            for i in range(num_graphs):
-                graph_nodes = x[batch == i]
-                if graph_nodes.numel() == 0:
-                    output_list.append(torch.zeros(self.d_model, device=x.device, dtype=x.dtype))
-                    continue
-                
-                # ISAB expects a batched input, so we add a temporary batch dimension
-                inducing_repr = self.isab_block(graph_nodes.unsqueeze(0))
-                # Mean pool the inducing point representations to get the global graph embedding
-                pooled_graph = torch.mean(inducing_repr.squeeze(0), dim=0)
-                output_list.append(pooled_graph)
-            
-            return torch.stack(output_list, dim=0)
+            dense_x, node_mask = to_dense_batch(x, batch)  # [B, L, D], [B, L]
+
+            inducing_repr = self.isab_block(dense_x)  # [B, K, D]
+            batch_size, num_inducing, _ = inducing_repr.shape
+
+            inducing_flat = inducing_repr.reshape(batch_size * num_inducing, self.d_model)
+            inducing_batch = torch.arange(batch_size, device=x.device).repeat_interleave(num_inducing)
+            global_embedding = global_mean_pool(inducing_flat, inducing_batch)
+
+            has_nodes = node_mask.any(dim=1)
+            if not torch.all(has_nodes):
+                global_embedding = global_embedding * has_nodes.unsqueeze(-1)
+
+            return global_embedding
 
         else:
             # Handle single graph or dense batch data

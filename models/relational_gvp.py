@@ -41,15 +41,16 @@ class GVP(nn.Module):
 
     def _init_weights(self):
         """Initializes weights for better numerical stability."""
-        nn.init.xavier_uniform_(self.scalar_linear.weight, gain=0.1)
-        nn.init.constant_(self.scalar_linear.bias, 0)
+        # Use deterministic initialization for reproducibility
+        torch.nn.init.xavier_uniform_(self.scalar_linear.weight, gain=0.1)
+        torch.nn.init.constant_(self.scalar_linear.bias, 0)
         
-        nn.init.xavier_uniform_(self.vector_linear.weight, gain=0.1)
-        nn.init.constant_(self.vector_linear.bias, 0)
+        torch.nn.init.xavier_uniform_(self.vector_linear.weight, gain=0.1)
+        torch.nn.init.constant_(self.vector_linear.bias, 0)
         
         if self.vector_gate:
-            nn.init.xavier_uniform_(self.vector_gate_linear.weight, gain=0.1)
-            nn.init.constant_(self.vector_gate_linear.bias, 0)
+            torch.nn.init.xavier_uniform_(self.vector_gate_linear.weight, gain=0.1)
+            torch.nn.init.constant_(self.vector_gate_linear.bias, 0)
 
     def _stable_vector_norm(self, vectors: torch.Tensor) -> torch.Tensor:
         """Calculates vector norms in a numerically stable manner."""

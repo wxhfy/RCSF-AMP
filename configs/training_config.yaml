@@ -4,40 +4,67 @@ paths:
   checkpoint_dir: ./outputs/checkpoints
   log_dir: ./outputs/logs
 
+data:
+  extra_embeddings:
+    esm_amp:
+      attr: amp_embedding
+      path: /home/20T-1/fyh0106/compare/merged_amp_decoy/embeddings/amp_embedding
+      type: file
+    protbert:
+      attr: protbert_embedding
+      path: /home/20T-1/fyh0106/compare/merged_amp_decoy/embeddings/protbert_embedding
+      type: file
+    one_hot:
+      attr: one_hot_embedding
+      type: one_hot_from_x
+      dim: 21
+
+# Random seed for reproducibility
+random_seed: 42
+
 # Model architecture configuration
 model:
   architecture:
     hidden_dim: 512
-    dropout: 0.15
-    gvp_layers: 1
-    rgat_layers: 2
-    rgat_heads: 16
+    dropout: 0.1
+    gvp_layers: 2
+    rgat_layers: 3
+    rgat_heads: 16  #  512 % 8 == 0
     cross_attention_heads: 16
     mamba_layers: 2
-    mamba_d_state: 32
-    mamba_d_conv: 8
-    mamba_expand: 4
+    mamba_d_state: 8
+    mamba_d_conv: 6
+    mamba_expand: 2
     laplacian_k: 16
     node_scalar_dim: 22
     node_vector_dim: 1
     edge_scalar_dim: 10
-  
+
   esm:
     # Name or local path of the pre-trained ESM model
     base_model_name_or_path: facebook/esm2_t36_3B_UR50D
 
+  sequence_inputs:
+    esm:
+      attr: amp_embedding
+      in_dim: 2560
+    protbert:
+      attr: protbert_embedding
+      in_dim: 1024
+    one_hot:
+      attr: one_hot_embedding
+      in_dim: 21
+
 # Training process configuration
 training:
-  batch_size: 32
+  device: cuda:3
+  batch_size: 128
   num_workers: 16
-  
-  # Evaluation threshold for converting probabilities to binary predictions
-  evaluation:
-    threshold: 0.5
+  pin_memory: true
   
   optimizer_params:
     type: AdamW
-    weight_decay: 0.03
+    weight_decay: 0.05
 
   scheduler_params:
     scheduler_type: cosine_annealing
@@ -72,12 +99,12 @@ training:
         - supervised_contrastive
       loss_weights:
         activity: 1.0
-        alignment_contrastive: 0.01
-        supervised_contrastive: 0.46
+        alignment_contrastive: 0.1
+        supervised_contrastive: 0.8
       optimizer:
         lr: 1.68e-05
       early_stopping:
         enable: true
         monitor: val_mcc
         mode: max
-        patience: 7
+        patience: 10

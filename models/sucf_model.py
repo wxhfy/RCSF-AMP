@@ -65,6 +65,11 @@ class SUCF(nn.Module):
         self.mamba_d_conv = arch_config.get('mamba_d_conv', 4)
         self.mamba_expand = arch_config.get('mamba_expand', 2)
         
+        # Sequence input specification (supports multi-modal concatenation)
+        self.sequence_input_specs = self._prepare_sequence_input_specs()
+        self.sequence_feature_names = [spec['attr'] for spec in self.sequence_input_specs]
+        self.sequence_combined_dim = sum(spec['in_dim'] for spec in self.sequence_input_specs)
+
         # --- Build model architecture ---
         self._build_input_encoders()
         self._build_structure_mapper()
@@ -77,13 +82,33 @@ class SUCF(nn.Module):
         
         logger.info(f"SUCF model initialized with hidden_dim={self.hidden_dim}")
         
+    def _prepare_sequence_input_specs(self):
+        """Parses the sequence input configuration into a normalized list."""
+        sequence_cfg = self.config.get('sequence_inputs', {}) or {}
+        specs = []
+
+        if sequence_cfg:
+            for key, cfg in sequence_cfg.items():
+                attr_name = cfg.get('attr', key)
+                in_dim = cfg.get('in_dim')
+                if in_dim is None:
+                    raise ValueError(f"Sequence input '{key}' is missing 'in_dim' in the configuration.")
+                specs.append({'name': key, 'attr': attr_name, 'in_dim': int(in_dim)})
+
+        if not specs:
+            esm_cfg = self.config.get('esm', {})
+            specs.append({
+                'name': 'esm',
+                'attr': 'amp_embedding',
+                'in_dim': int(esm_cfg.get('output_dim', 2560))
+            })
+
+        return specs
+
     def _build_input_encoders(self):
         """Builds the input encoders."""
-        # ESM sequence encoder
-        esm_config = self.config.get('esm', {})
-        esm_dim = esm_config.get('output_dim', 2560)
-        self.esm_projection = ESMProjectionHead(
-            in_dim=esm_dim,
+        self.sequence_projection = ESMProjectionHead(
+            in_dim=self.sequence_combined_dim,
             out_dim=self.hidden_dim
         )
         
@@ -209,7 +234,27 @@ class SUCF(nn.Module):
             output_dict: A dictionary containing prediction results and intermediate features.
         """
         # --- 0. Input Encoding ---
-        seq_emb_0 = self.esm_projection(data.amp_embedding)
+        batch_index = getattr(data, 'batch', None)
+        sequence_feature_chunks = []
+        for feature_name in self.sequence_feature_names:
+            if not hasattr(data, feature_name):
+                raise AttributeError(
+                    f"Data sample is missing required sequence feature '{feature_name}'."
+                )
+
+            feature_tensor = getattr(data, feature_name)
+            if feature_tensor.dim() == 3 and feature_tensor.size(0) == 1:
+                feature_tensor = feature_tensor.squeeze(0)
+
+            if feature_tensor.size(0) != data.num_nodes:
+                raise ValueError(
+                    f"Feature '{feature_name}' length {feature_tensor.size(0)} does not match graph nodes {data.num_nodes}."
+                )
+
+            sequence_feature_chunks.append(feature_tensor)
+
+        combined_sequence_features = torch.cat(sequence_feature_chunks, dim=-1)
+        seq_emb_0 = self.sequence_projection(combined_sequence_features)
         
         struct_scalar, struct_vector = self.rgvp_encoder(
             x_s_in=data.x,
@@ -239,7 +284,9 @@ class SUCF(nn.Module):
         # --- 2. Graph-Guided Sequence Feature Refinement ---
         refined_seq_features = self.seq_refiner(
             query=structure_map,
-            key_value=seq_emb_0
+            key_value=seq_emb_0,
+            query_batch=batch_index,
+            key_value_batch=batch_index
         )
         
         seq_emb_1 = self.seq_gate(
@@ -250,7 +297,9 @@ class SUCF(nn.Module):
         # --- 3. Mamba-Driven Final Fusion ---
         checked_struct_features = self.struct_checker(
             query=seq_emb_1,
-            key_value=struct_emb_0
+            key_value=struct_emb_0,
+            query_batch=batch_index,
+            key_value_batch=batch_index
         )
         
         combined_features = torch.cat([

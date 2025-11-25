@@ -19,6 +19,7 @@ class LaplacianPositionalEncoding(nn.Module):
         super().__init__()
         self.k = k
         self.normalization = normalization
+        self.cache = {}
         
     def forward(self, data):
         """
@@ -40,6 +41,7 @@ class LaplacianPositionalEncoding(nn.Module):
             data.batch = torch.zeros(data.num_nodes, dtype=torch.long, device=device)
         
         pos_encodings = []
+        seq_ids = getattr(data, 'seq_id', None)
         
         # Process each graph in the batch individually
         for i in range(batch_size):
@@ -50,6 +52,16 @@ class LaplacianPositionalEncoding(nn.Module):
                 pos_encodings.append(torch.zeros(num_nodes, self.k, device=device))
                 continue
             
+            # Attempt cache lookup using sequence identifiers when available
+            cache_key = self._make_cache_key(seq_ids, i, num_nodes)
+            if cache_key is not None and cache_key in self.cache:
+                cached = self.cache[cache_key]
+                if cached.size(0) == num_nodes:
+                    pos_encodings.append(cached.to(device))
+                    continue
+                else:
+                    self.cache.pop(cache_key, None)
+
             # Extract the subgraph for the current graph
             node_idx = torch.where(mask)[0]
             edge_mask = torch.isin(data.edge_index[0], node_idx) & torch.isin(data.edge_index[1], node_idx)
@@ -90,8 +102,26 @@ class LaplacianPositionalEncoding(nn.Module):
                 pos_enc = torch.zeros(num_nodes, self.k, device=device)
                 
             pos_encodings.append(pos_enc)
+
+            if cache_key is not None:
+                self.cache[cache_key] = pos_enc.detach().cpu()
         
         return torch.cat(pos_encodings, dim=0)
+
+    def _make_cache_key(self, seq_ids, graph_index, num_nodes):
+        """Creates a cache key for the given graph if possible."""
+        if seq_ids is None:
+            return None
+
+        if isinstance(seq_ids, (list, tuple)):
+            if graph_index < len(seq_ids):
+                return (seq_ids[graph_index], num_nodes)
+            return None
+
+        if isinstance(seq_ids, str):
+            return (seq_ids, num_nodes)
+
+        return None
 
 
 class GRUGate(nn.Module):

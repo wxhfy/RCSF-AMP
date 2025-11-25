@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import os
 import torch
 import numpy as np
 from typing import List, Dict, Optional, Tuple, Any, Union
@@ -33,10 +34,37 @@ class ESMEmbedder:
         self.include_bos_eos = include_bos_eos
         self.max_sequence_length = max_sequence_length
 
-        # Try to load from local path first, fallback to HuggingFace Hub if not found or failed
+        # Build a prioritized list of candidate locations for the ESM weights.
         model_load_paths = []
-        if local_model_path_root and Path(local_model_path_root).is_dir():
-            model_load_paths.append(str(Path(local_model_path_root).resolve()))
+
+        def _collect_valid_paths(raw_entry: Optional[str]):
+            if not raw_entry:
+                return []
+            # Allow os.pathsep separated entries so users can pass multiple roots.
+            entries = [seg for seg in raw_entry.split(os.pathsep) if seg]
+            valid = []
+            for entry in entries:
+                path_obj = Path(entry).expanduser().resolve()
+                if path_obj.is_dir():
+                    valid.append(str(path_obj))
+            return valid
+
+        # 1) Explicitly provided path(s)
+        model_load_paths.extend(_collect_valid_paths(local_model_path_root))
+
+        # 2) Environment override (ESM_MODEL_DIRS allows quick reconfiguration without editing code)
+        model_load_paths.extend(_collect_valid_paths(os.environ.get("ESM_MODEL_DIRS")))
+
+        # 3) Built-in fallbacks for this project
+        default_local_roots = [
+            "/home/4T-1/fyh/work/utils/esm_lora/esm2/",
+            "/home/fyh0106/SUCF/baseline/esm-AxP-GDL/models/esm2/checkpoints/",
+        ]
+        for fallback in default_local_roots:
+            if str(Path(fallback).expanduser().resolve()) not in model_load_paths:
+                model_load_paths.extend(_collect_valid_paths(fallback))
+
+        # Finally, fall back to pulling from HuggingFace Hub
         model_load_paths.append(model_name)
 
         last_error = None

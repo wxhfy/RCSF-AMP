@@ -71,22 +71,3 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("Config is missing required path: 'paths.data_root'")
     
     logger.info("Configuration validation successful.")
-
-def get_evaluation_threshold(config: Dict[str, Any], default: float = 0.5) -> float:
-    """
-    Retrieves the evaluation threshold from the configuration.
-    
-    Args:
-        config: The configuration dictionary.
-        default: The default threshold to use if not found.
-        
-    Returns:
-        The evaluation threshold as a float.
-    """
-    try:
-        threshold = config.get('training', {}).get('evaluation', {}).get('threshold', default)
-        logger.info(f"Using evaluation threshold: {threshold}")
-        return float(threshold)
-    except (KeyError, ValueError, TypeError) as e:
-        logger.warning(f"Could not retrieve threshold from config, using default {default}: {e}")
-        return default

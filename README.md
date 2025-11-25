@@ -1,6 +1,6 @@
 # SUCF: 结构门控的跨模态融合网络 (Sructurally Uncertainty-aware Cross-modal Fusion)
 
-本项目是一个先进的深度学习框架，旨在通过融合蛋白质的序列和结构信息来预测其生物活性。该模型的核心创新在于其三阶段架构，利用 pLDDT 分数门控的关系图注意力网络（RGAT）来处理结构，并使用 Mamba 模块高效地融合跨模态特征。
+本项目旨在通过融合蛋白质的序列和结构信息来预测其生物活性。该模型的核心创新在于其三阶段架构，利用 pLDDT 分数门控的关系图注意力网络（RGAT）来处理结构，并使用 Mamba 模块高效地融合跨模态特征。
 
 模型名称 **SUCF** 来源于其核心思想: **S**ructurally **U**ncertainty-aware **C**ross-modal **F**usion。
 

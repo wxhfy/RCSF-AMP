@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from torch_geometric.utils import to_dense_batch
 
 class CrossAttention(nn.Module):
     """
@@ -40,7 +41,7 @@ class CrossAttention(nn.Module):
         # Layer normalization
         self.norm = nn.LayerNorm(hidden_dim)
     
-    def forward(self, query, key_value, mask=None):
+    def forward(self, query, key_value, mask=None, query_batch=None, key_value_batch=None):
         """
         Forward pass for the CrossAttention layer.
 
@@ -52,13 +53,14 @@ class CrossAttention(nn.Module):
         Returns:
             torch.Tensor: The contextualized query features, with the same shape as the input query.
         """
-        # Save original query for the residual connection
         residual = query
-        
-        # Handle 2D inputs by adding a temporary batch dimension
-        is_2d = query.dim() == 2
-        if is_2d:
-            query, key_value, residual = query.unsqueeze(0), key_value.unsqueeze(0), residual.unsqueeze(0)
+
+        query, query_mask = self._prepare_dense(query, query_batch)
+        residual_dense = query
+        key_value, key_mask = self._prepare_dense(
+            key_value,
+            key_value_batch if key_value_batch is not None else query_batch
+        )
 
         batch_size, seq_length_q, _ = query.shape
         _, seq_length_kv, _ = key_value.shape
@@ -76,7 +78,11 @@ class CrossAttention(nn.Module):
         # 3. Compute attention scores (scaled dot-product)
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim) # [B, n_heads, L_q, L_kv]
 
-        # 4. Apply mask if provided
+        # 4. Apply masks to block padding or cross-graph leakage
+        if key_mask is not None:
+            expanded_key_mask = key_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L_kv]
+            attn_scores = attn_scores.masked_fill(~expanded_key_mask, float('-inf'))
+
         if mask is not None:
             if mask.dtype != torch.bool:
                 mask = mask.bool()
@@ -95,11 +101,39 @@ class CrossAttention(nn.Module):
         # 8. Final projection, dropout, residual connection, and normalization
         attn_output = self.out_proj(attn_output)
         attn_output = self.output_dropout(attn_output)
-        attn_output = attn_output + residual
+
+        # Mask padded query positions to keep zeros inactive
+        if query_mask is not None:
+            attn_output = attn_output.masked_fill(~query_mask.unsqueeze(-1), 0.0)
+
+        attn_output = attn_output + residual_dense
         attn_output = self.norm(attn_output)
 
-        # Remove the temporary batch dimension if the input was 2D
-        if is_2d:
-            attn_output = attn_output.squeeze(0)
-            
-        return attn_output
+        return self._restore_sparse(attn_output, query_mask, residual.dim(), query_batch)
+
+    def _prepare_dense(self, tensor, batch_index):
+        """Converts sparse PyG batches to dense tensors with masks."""
+        if tensor.dim() == 3:
+            mask = torch.ones(
+                tensor.size(0), tensor.size(1), dtype=torch.bool, device=tensor.device
+            )
+            return tensor, mask
+
+        if batch_index is not None:
+            dense, mask = to_dense_batch(tensor, batch_index)
+            return dense, mask
+
+        # Single graph without batch info
+        dense = tensor.unsqueeze(0)
+        mask = torch.ones(1, tensor.size(0), dtype=torch.bool, device=tensor.device)
+        return dense, mask
+
+    def _restore_sparse(self, tensor, mask, original_dim, batch_index):
+        """Restores dense outputs back to PyG sparse formatting."""
+        if original_dim == 3:
+            return tensor
+
+        if batch_index is not None and mask is not None:
+            return tensor[mask]
+
+        return tensor.squeeze(0)
