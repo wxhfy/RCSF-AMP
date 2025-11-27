@@ -279,7 +279,11 @@ class SUCF(nn.Module):
                 seq_features=seq_emb_0  # Pass sequence features for guided bias
             )
         
-        structure_map = self.plddt_gating(raw_structure_map, data.plddt)
+        structure_map = self.plddt_gating(
+            struct_feats=raw_structure_map,
+            seq_feats=seq_emb_0,
+            plddt=data.plddt
+        )
         
         # --- 2. Graph-Guided Sequence Feature Refinement ---
         refined_seq_features = self.seq_refiner(

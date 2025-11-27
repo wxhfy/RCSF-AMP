@@ -54,11 +54,15 @@ def set_random_seed(seed):
 class SUCFTrainer:
     """SUCF Trainer, supporting two-stage training."""
 
-    def __init__(self, config_path):
+    def __init__(self, config_path, device_override=None):
         """Initializes the trainer."""
         self.config_path = Path(config_path).resolve()
         self.config = load_config(self.config_path)
         validate_config(self.config)
+        self.device_override = device_override
+        if self.device_override:
+            training_cfg = self.config.setdefault('training', {})
+            training_cfg['device'] = self.device_override
 
         # Set random seed for reproducibility
         seed = self.config.get('random_seed', 42)
@@ -79,7 +83,6 @@ class SUCFTrainer:
         self.current_stage = None
         self.current_epoch = 0
         self.best_metrics = {}
-        self.stage_thresholds = {}
         
         logger.info("SUCF Trainer initialized successfully.")
 
@@ -123,12 +126,12 @@ class SUCFTrainer:
     def _select_device(self):
         """Selects the compute device, honoring any config override."""
         training_cfg = self.config.get('training', {})
-        device_override = training_cfg.get('device')
+        device_str = self.device_override or training_cfg.get('device')
 
-        if device_override:
-            device = torch.device(device_override)
+        if device_str:
+            device = torch.device(device_str)
             if device.type == 'cuda' and not torch.cuda.is_available():
-                raise RuntimeError(f"CUDA override requested ({device_override}) but CUDA is unavailable.")
+                raise RuntimeError(f"CUDA override requested ({device_str}) but CUDA is unavailable.")
         else:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -169,35 +172,6 @@ class SUCFTrainer:
         )
         logger.info(f"Created Optimizer: AdamW, Default LR: {default_lr}, Head LR: {head_lr}")
 
-    def _search_best_threshold(self, targets, probabilities, metric_name='mcc'):
-        """Finds the threshold that maximizes the specified metric on validation data."""
-        if targets.size == 0:
-            return 0.5, {}
-
-        probabilities = probabilities.astype(float)
-        targets = targets.astype(int)
-
-        unique_scores = np.unique(probabilities)
-        if unique_scores.size == 1:
-            candidate_thresholds = np.array([0.5])
-        else:
-            mid_points = (unique_scores[:-1] + unique_scores[1:]) / 2.0
-            candidate_thresholds = np.concatenate(([0.0], mid_points, [0.999999]))
-
-        best_threshold = 0.5
-        best_metric = -float('inf')
-        best_metrics_snapshot = None
-
-        for threshold in candidate_thresholds:
-            metrics = calculate_metrics(targets, probabilities, threshold=threshold)
-            metric_value = metrics.get(metric_name, 0.0)
-            if metric_value > best_metric:
-                best_metric = metric_value
-                best_threshold = float(threshold)
-                best_metrics_snapshot = metrics
-
-        return best_threshold, best_metrics_snapshot or {}
-    
     def train_epoch(self, train_loader, stage_config):
         """Trains the model for one epoch."""
         self.model.train()
@@ -233,7 +207,7 @@ class SUCFTrainer:
         return {'train_loss': total_loss / total_samples if total_samples > 0 else 0.0}
     
     def validate_epoch(self, val_loader, stage_config):
-        """Validates the model for one epoch and collects logits for threshold search."""
+        """Validates the model for one epoch using the default threshold (0.5)."""
         self.model.eval()
         total_loss, total_samples = 0.0, 0
         all_probs, all_targets = [], []
@@ -259,27 +233,14 @@ class SUCFTrainer:
                     all_targets.append(targets)
         
         val_metrics = {'val_loss': total_loss / total_samples if total_samples > 0 else 0.0}
-        aux_data = {
-            'probabilities': np.concatenate(all_probs) if all_probs else np.array([]),
-            'targets': np.concatenate(all_targets).astype(int) if all_targets else np.array([], dtype=int)
-        }
 
-        if aux_data['probabilities'].size > 0:
-            metrics = calculate_metrics(aux_data['targets'], aux_data['probabilities'])
+        if all_probs:
+            probabilities = np.concatenate(all_probs)
+            targets = np.concatenate(all_targets).astype(int)
+            metrics = calculate_metrics(targets, probabilities)
             val_metrics.update({f'val_{k}': v for k, v in metrics.items()})
-
-            best_thr, thr_metrics = self._search_best_threshold(aux_data['targets'], aux_data['probabilities'])
-            val_metrics['val_best_threshold'] = best_thr
-            val_metrics['val_best_threshold_mcc'] = thr_metrics.get('mcc', 0.0) if thr_metrics else 0.0
-            aux_data['best_threshold'] = best_thr
-            aux_data['best_threshold_metrics'] = thr_metrics
-        else:
-            aux_data['best_threshold'] = 0.5
-            aux_data['best_threshold_metrics'] = {}
-            val_metrics['val_best_threshold'] = 0.5
-            val_metrics['val_best_threshold_mcc'] = 0.0
         
-        return val_metrics, aux_data
+        return val_metrics
 
     def save_checkpoint(self, checkpoint_name, metrics=None, is_best=False):
         """Saves a training checkpoint."""
@@ -332,24 +293,17 @@ class SUCFTrainer:
         ) if early_stopping_config.get('enable', False) else None
         
         monitor_key = early_stopping_config.get('monitor', 'val_loss')
-        stage_best_threshold = None
-        stage_best_threshold_metrics = None
-        last_val_aux = None
 
         for epoch in range(stage_config.get('epochs', 10)):
             self.current_epoch = epoch + 1
             
             train_metrics = self.train_epoch(train_loader, stage_config)
-            val_metrics, val_aux = self.validate_epoch(val_loader, stage_config)
-            last_val_aux = val_aux
+            val_metrics = self.validate_epoch(val_loader, stage_config)
             
             log_message = (f"Stage {stage_name}, Epoch {self.current_epoch}: "
                            f"Train Loss: {train_metrics['train_loss']:.4f}, "
                            f"Val Loss: {val_metrics['val_loss']:.4f}, "
                            f"{self._format_metrics(val_metrics)}")
-
-            if 'val_best_threshold' in val_metrics:
-                log_message += f", Val Best Thr: {val_metrics['val_best_threshold']:.4f}"
             logger.info(log_message)
             
             if early_stopping:
@@ -360,25 +314,11 @@ class SUCFTrainer:
                
                 if monitor_metric == early_stopping.get_best_score():
                     self.save_checkpoint(f"best_model_stage_{stage_name}", val_metrics, is_best=True)
-                    stage_best_threshold = val_aux.get('best_threshold', stage_best_threshold)
-                    stage_best_threshold_metrics = val_aux.get('best_threshold_metrics', stage_best_threshold_metrics)
 
                 if should_stop:
                     break
 
         logger.info(f"--- Stage {stage_name} Finished ---")
-
-        if stage_best_threshold is None and last_val_aux is not None:
-            stage_best_threshold = last_val_aux.get('best_threshold', 0.5)
-            stage_best_threshold_metrics = last_val_aux.get('best_threshold_metrics', {})
-
-        self.stage_thresholds[stage_name] = {
-            'threshold': stage_best_threshold if stage_best_threshold is not None else 0.5,
-            'metrics': stage_best_threshold_metrics or {}
-        }
-        logger.info(
-            f"Stage {stage_name} best dynamic threshold: {self.stage_thresholds[stage_name]['threshold']:.4f}"
-        )
 
     def train(self, train_loader, val_loader, test_loader=None):
         """Executes the full two-stage training pipeline."""
@@ -417,36 +357,22 @@ class SUCFTrainer:
         else:
             logger.warning("No best model checkpoint found. Using the current model state for testing.")
         
-        test_metrics, test_aux = self.validate_epoch(
+        test_metrics = self.validate_epoch(
             test_loader, self.config['training']['sub_stages'][last_stage]
         )
-
-        dynamic_threshold = self.stage_thresholds.get(last_stage, {}).get('threshold', 0.5)
-        if test_aux['probabilities'].size > 0:
-            dynamic_metrics = calculate_metrics(
-                test_aux['targets'], test_aux['probabilities'], threshold=dynamic_threshold
-            )
-        else:
-            dynamic_metrics = {}
 
         logger.info("=" * 50)
         logger.info("Final Test Set Results")
         logger.info("=" * 50)
         logger.info(f"Test Loss: {test_metrics.get('val_loss', 0.0):.4f}")
         logger.info(f"Default Threshold (0.5) Metrics: {self._format_metrics(test_metrics)}")
-        logger.info(
-            f"Dynamic Threshold ({dynamic_threshold:.4f}) Metrics: "
-            f"{self._format_metrics({f'val_{k}': v for k, v in dynamic_metrics.items()})}"
-        )
         logger.info("=" * 50)
         
         results_payload = {
             'config': str(self.config_path),
             'run_id': self.run_id,
-            'default_threshold': 0.5,
-            'default_metrics': test_metrics,
-            'dynamic_threshold': dynamic_threshold,
-            'dynamic_metrics': dynamic_metrics
+            'threshold': 0.5,
+            'metrics': test_metrics
         }
         
         results_filename = f"final_test_results_{self.config_path.stem}_{self.run_id}.json"
@@ -491,11 +417,12 @@ def main():
     parser = argparse.ArgumentParser(description='SUCF Training Script')
     parser.add_argument('--config', type=str, required=True, help='Path to the training configuration file.')
     parser.add_argument('--test-mode', action='store_true', help='Run in test mode with minimal epochs for validation.')
+    parser.add_argument('--device', type=str, help='Override compute device, e.g., cuda:0')
     
     args = parser.parse_args()
     
     try:
-        trainer = SUCFTrainer(args.config)
+        trainer = SUCFTrainer(args.config, device_override=args.device)
 
         # In test mode, modify the config to run a quick test
         if args.test_mode:

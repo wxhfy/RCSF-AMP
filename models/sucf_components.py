@@ -214,38 +214,28 @@ class MambaLayer(nn.Module):
 
 
 class PLDDTGating(nn.Module):
-    """
-    A pLDDT confidence gating module.
-    It modulates feature weights based on structure prediction confidence.
-    """
+    """Confidence gate that blends structure and sequence streams using pLDDT."""
+
     def __init__(self, feature_dim):
         super().__init__()
-        
-        self.confidence_projection = nn.Sequential(
-            nn.Linear(1, feature_dim // 4),
-            nn.ReLU(),
-            nn.Linear(feature_dim // 4, feature_dim),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, features, plddt_scores):
-        """
-        Applies pLDDT gating to the input features.
+        self.gate_projection = nn.Linear(1, feature_dim)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, struct_feats, seq_feats, plddt):
+        """Fuse structure and sequence features based on pLDDT confidence.
 
         Args:
-            features (torch.Tensor): Input features of shape [N, feature_dim].
-            plddt_scores (torch.Tensor): pLDDT scores of shape [N] (ranging from 0-100).
-            
+            struct_feats (torch.Tensor): Structure features [N, feature_dim].
+            seq_feats (torch.Tensor): Sequence features [N, feature_dim].
+            plddt (torch.Tensor): Raw pLDDT scores [N] or [N, 1].
+
         Returns:
-            torch.Tensor: Gated features of shape [N, feature_dim].
+            torch.Tensor: Weighted sum of the two feature streams.
         """
-        # Normalize pLDDT scores to the range [0, 1]
-        normalized_plddt = (plddt_scores / 100.0).unsqueeze(-1)  # Shape: [N, 1]
-        
-        # Compute gate weights from the confidence scores
-        gate_weights = self.confidence_projection(normalized_plddt) # Shape: [N, feature_dim]
-        
-        # Apply the gate
-        gated_features = features * gate_weights
-        
-        return gated_features
+        if plddt.dim() == 1:
+            plddt = plddt.unsqueeze(-1)
+
+        normalized_plddt = plddt / 100.0
+        gate = self.sigmoid(self.gate_projection(normalized_plddt))
+
+        return (gate * struct_feats) + ((1.0 - gate) * seq_feats)

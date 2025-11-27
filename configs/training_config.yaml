@@ -59,7 +59,7 @@ model:
 training:
   device: cuda:3
   batch_size: 128
-  num_workers: 16
+  num_workers: 16 
   pin_memory: true
   
   optimizer_params:
@@ -107,4 +107,4 @@ training:
         enable: true
         monitor: val_mcc
         mode: max
-        patience: 10
+        patience: 15
