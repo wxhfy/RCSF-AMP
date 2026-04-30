@@ -25,3 +25,9 @@ runs/
 todo*
 *.tar.gz*
 *ablation*
+*.sh
+scripts
+extend
+outputs_archive/
+.shrimp/
+
