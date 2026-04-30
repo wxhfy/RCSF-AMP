@@ -51,7 +51,8 @@ class RelationalGATv3Conv(MessagePassing):
                  edge_dim: int = None,
                  concat: bool = True,
                  temperature: float = 1.0,
-                 seq_bias_dim: int = None):
+                 seq_bias_dim: int = None,
+                 plddt_bias_dim: int = None):
         super().__init__(aggr='add', node_dim=0)
         
         self.in_channels = in_channels
@@ -77,7 +78,7 @@ class RelationalGATv3Conv(MessagePassing):
             ])
 
         # Processor for sequence feature bias
-        if seq_bias_dim is not None:
+        if seq_bias_dim is not None and seq_bias_dim > 0:
             self.seq_bias_processor = nn.Sequential(
                 nn.Linear(seq_bias_dim, heads * 16),
                 nn.GELU(),
@@ -85,6 +86,18 @@ class RelationalGATv3Conv(MessagePassing):
                 nn.Linear(heads * 16, heads),
                 nn.Tanh()  # Constrain bias range to [-1, 1]
             )
+
+        # Processor for pLDDT-based attention bias (Baseline 3)
+        if plddt_bias_dim is not None and plddt_bias_dim > 0:
+            self.plddt_bias_processor = nn.Sequential(
+                nn.Linear(plddt_bias_dim, heads * 16),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(heads * 16, heads),
+                nn.Tanh()  # Constrain bias range to [-1, 1]
+            )
+        else:
+            self.plddt_bias_processor = None
         
         self.attn_dropout = nn.Dropout(dropout)
         self.reset_parameters()
@@ -105,29 +118,35 @@ class RelationalGATv3Conv(MessagePassing):
         if hasattr(self, 'seq_bias_processor'):
             for layer in self.seq_bias_processor:
                 if isinstance(layer, nn.Linear):
-                    # Use a smaller gain for the bias to ensure it has a gentle effect initially
                     nn.init.xavier_normal_(layer.weight, gain=gain * 0.1)
 
-    def forward(self, x, edge_index, edge_attr=None, seq_features=None):
+        if hasattr(self, 'plddt_bias_processor') and self.plddt_bias_processor is not None:
+            for layer in self.plddt_bias_processor:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_normal_(layer.weight, gain=gain * 0.1)
+
+    def forward(self, x, edge_index, edge_attr=None, seq_features=None, plddt_features=None):
         """Forward pass."""
         # Project inputs into query, key, and value spaces for each head
         query = self.lin_query(x).view(-1, self.heads, self.out_channels)
         key = self.lin_key(x).view(-1, self.heads, self.out_channels)
         value = self.lin_value(x).view(-1, self.heads, self.out_channels)
-        
+
         # Start message passing
         out = self.propagate(edge_index, query=query, key=key, value=value,
-                             edge_attr=edge_attr, seq_features=seq_features)
-        
+                             edge_attr=edge_attr, seq_features=seq_features,
+                             plddt_features=plddt_features)
+
         # Concatenate or average the outputs of the attention heads
         if self.concat:
             out = out.view(-1, self.heads * self.out_channels)
         else:
             out = out.mean(dim=1)
-            
+
         return out
 
-    def message(self, query_i, key_j, value_j, edge_attr, seq_features_i, seq_features_j, index):
+    def message(self, query_i, key_j, value_j, edge_attr, seq_features_i, seq_features_j,
+                index, plddt_features_i=None, plddt_features_j=None):
         """Computes messages and attention weights for each edge."""
         # 1. Calculate raw attention scores
         scale = self.out_channels ** 0.5
@@ -137,13 +156,13 @@ class RelationalGATv3Conv(MessagePassing):
         if edge_attr is not None and hasattr(self, 'edge_type_encoders'):
             edge_type = torch.argmax(edge_attr[:, -2:], dim=-1)
             edge_features = edge_attr[:, :-2]
-            
+
             edge_attention_modifiers = torch.zeros_like(attention_logits)
             for i in range(len(self.edge_type_encoders)):
                 mask = (edge_type == i)
                 if mask.any():
                     edge_attention_modifiers[mask] = self.edge_type_encoders[i](edge_features[mask])
-            
+
             attention_logits = attention_logits + edge_attention_modifiers
 
         # 3. Add bias from sequence features
@@ -152,11 +171,16 @@ class RelationalGATv3Conv(MessagePassing):
             seq_bias = self.seq_bias_processor(seq_diff)
             attention_logits = attention_logits + 0.1 * seq_bias
 
-        # 4. Apply temperature and compute attention weights
+        # 4. Add bias from pLDDT confidence features (Baseline 3)
+        if plddt_features_i is not None and hasattr(self, 'plddt_bias_processor') and self.plddt_bias_processor is not None:
+            plddt_bias = self.plddt_bias_processor(plddt_features_i)
+            attention_logits = attention_logits + 0.1 * plddt_bias
+
+        # 5. Apply temperature and compute attention weights
         attention_weights = custom_grouped_softmax(attention_logits / self.temperature, index)
         attention_weights = self.attn_dropout(attention_weights)
 
-        # 5. Weight values by attention and return as messages
+        # 6. Weight values by attention and return as messages
         return value_j * attention_weights.unsqueeze(-1)
 
     def update_temperature(self, new_temperature: float):
@@ -169,16 +193,16 @@ class RGATv3Block(nn.Module):
     A complete RGATv3 block, including LayerNorm and residual connections.
     """
     def __init__(self, in_channels, out_channels, heads=8, dropout=0.3, edge_dim=None,
-                 temperature=1.0, seq_bias_dim=None):
+                 temperature=1.0, seq_bias_dim=None, plddt_bias_dim=None):
         super(RGATv3Block, self).__init__()
-        
+
         self.norm = nn.LayerNorm(in_channels)
-        
+
         # If input and output dimensions don't match, create a projection for the residual connection
         self.projection = None
         if (heads * out_channels != in_channels):
             self.projection = nn.Linear(in_channels, heads * out_channels)
-        
+
         self.gatv3 = RelationalGATv3Conv(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -187,31 +211,33 @@ class RGATv3Block(nn.Module):
             edge_dim=edge_dim,
             concat=True,
             temperature=temperature,
-            seq_bias_dim=seq_bias_dim
+            seq_bias_dim=seq_bias_dim,
+            plddt_bias_dim=plddt_bias_dim
         )
-        
+
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, edge_index, edge_attr=None, seq_features=None):
+    def forward(self, x, edge_index, edge_attr=None, seq_features=None, plddt_features=None):
         """Forward pass for the block."""
         identity = x
-        
+
         # Pre-normalization
         x = self.norm(x)
-        
+
         # GATv3 convolution
-        x = self.gatv3(x, edge_index, edge_attr=edge_attr, seq_features=seq_features)
-        
+        x = self.gatv3(x, edge_index, edge_attr=edge_attr,
+                       seq_features=seq_features, plddt_features=plddt_features)
+
         x = self.gelu(x)
         x = self.dropout(x)
-        
+
         # Residual connection
         if self.projection:
             identity = self.projection(identity)
-        
+
         x = x + identity
-        
+
         return x
 
     def update_temperature(self, new_temperature: float):
