@@ -17,9 +17,9 @@ from .amp_multimodal_model import StructuralFeatureProjection, ActivityHead
 
 # Import SUCF-specific components
 from .sucf_components import (
-    LaplacianPositionalEncoding, 
-    GRUGate, 
-    MambaLayer, 
+    LaplacianPositionalEncoding,
+    GRUGate,
+    MambaLayer,
     PLDDTGating
 )
 
@@ -64,7 +64,7 @@ class SUCF(nn.Module):
         self.mamba_d_state = arch_config.get('mamba_d_state', 16)
         self.mamba_d_conv = arch_config.get('mamba_d_conv', 4)
         self.mamba_expand = arch_config.get('mamba_expand', 2)
-        
+
         # Sequence input specification (supports multi-modal concatenation)
         self.sequence_input_specs = self._prepare_sequence_input_specs()
         self.sequence_feature_names = [spec['attr'] for spec in self.sequence_input_specs]
@@ -174,7 +174,7 @@ class SUCF(nn.Module):
             num_heads=self.cross_attention_heads,
             dropout=self.dropout
         )
-        
+
         # Mamba for final integration
         self.final_fusion_layers = nn.ModuleList()
         for _ in range(self.mamba_layers):
@@ -186,7 +186,7 @@ class SUCF(nn.Module):
                     expand=self.mamba_expand
                 )
             )
-        
+
         # Project back to the standard hidden dimension
         self.final_projection = nn.Sequential(
             nn.Linear(self.hidden_dim * 3, self.hidden_dim),
@@ -222,14 +222,14 @@ class SUCF(nn.Module):
         
         self.pos_enc_linear.apply(init_linear_layers)
         self.final_projection.apply(init_linear_layers)
-    
+
     def forward(self, data):
         """
         SUCF forward pass.
-        
+
         Args:
             data: PyG Data object containing sequence and structure information.
-            
+
         Returns:
             output_dict: A dictionary containing prediction results and intermediate features.
         """
@@ -255,7 +255,7 @@ class SUCF(nn.Module):
 
         combined_sequence_features = torch.cat(sequence_feature_chunks, dim=-1)
         seq_emb_0 = self.sequence_projection(combined_sequence_features)
-        
+
         struct_scalar, struct_vector = self.rgvp_encoder(
             x_s_in=data.x,
             x_v_in=data.node_vector,
@@ -264,11 +264,11 @@ class SUCF(nn.Module):
             edge_vector=data.edge_vector
         )
         struct_emb_0 = self.struct_projection(struct_scalar, struct_vector)
-        
+
         pos_enc = self.pos_encoding(data)
         pos_emb = self.pos_enc_linear(pos_enc)
         struct_emb_0 = struct_emb_0 + pos_emb
-        
+
         # --- 1. pLDDT-Gated Relational Graph Mapping ---
         raw_structure_map = struct_emb_0
         for rgat_layer in self.structure_mapper:
@@ -278,13 +278,13 @@ class SUCF(nn.Module):
                 edge_attr=data.edge_attr,
                 seq_features=seq_emb_0  # Pass sequence features for guided bias
             )
-        
+
         structure_map = self.plddt_gating(
             struct_feats=raw_structure_map,
             seq_feats=seq_emb_0,
             plddt=data.plddt
         )
-        
+
         # --- 2. Graph-Guided Sequence Feature Refinement ---
         refined_seq_features = self.seq_refiner(
             query=structure_map,
@@ -292,12 +292,12 @@ class SUCF(nn.Module):
             query_batch=batch_index,
             key_value_batch=batch_index
         )
-        
+
         seq_emb_1 = self.seq_gate(
             state=seq_emb_0,
             input_features=refined_seq_features
         )
-        
+
         # --- 3. Mamba-Driven Final Fusion ---
         checked_struct_features = self.struct_checker(
             query=seq_emb_1,
@@ -305,29 +305,29 @@ class SUCF(nn.Module):
             query_batch=batch_index,
             key_value_batch=batch_index
         )
-        
+
         combined_features = torch.cat([
             struct_emb_0,             # Original structure features
             seq_emb_1,                # Refined sequence features
             checked_struct_features   # Checked structure features
         ], dim=-1)
-        
+
         fused_features = combined_features
         for mamba_layer in self.final_fusion_layers:
             fused_features = mamba_layer(fused_features, batch=data.batch)
-        
+
         fused_node_embedding = self.final_projection(fused_features)
-        
+
         # --- 4. Prediction ---
         global_embedding = self.global_pooling(fused_node_embedding, data.batch)
         activity_pred = self.activity_predictor(global_embedding)
-        
+
         # --- Construct Output Dictionary ---
         return {
             'activity_pred': activity_pred,
             'seq_global': self.global_pooling(seq_emb_1, data.batch),
             'struct_global': self.global_pooling(struct_emb_0, data.batch),
-            'combined_global': global_embedding,  
+            'combined_global': global_embedding,
             'fused_node_features': fused_node_embedding,
         }
 

@@ -52,14 +52,23 @@ class RelationalGATv3Conv(MessagePassing):
                  concat: bool = True,
                  temperature: float = 1.0,
                  seq_bias_dim: int = None,
-                 plddt_bias_dim: int = None):
+                 plddt_bias_dim: int = None,
+                 use_conf_gate: bool = True,
+                 conf_gate_threshold: float = 50.0,
+                 conf_gate_slope: float = 10.0):
         super().__init__(aggr='add', node_dim=0)
-        
+
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.heads = heads
         self.concat = concat
         self.temperature = temperature
+        # Sender-side confidence gate: low-pLDDT nodes broadcast weakened messages.
+        # Confidence is injected *inside* RGAT so noise from low-confidence residues
+        # cannot contaminate neighbours during message passing (Codex review fix).
+        self.use_conf_gate = bool(use_conf_gate)
+        self.conf_gate_threshold = float(conf_gate_threshold)
+        self.conf_gate_slope = float(conf_gate_slope)
         
         # Core attention projections
         self.lin_query = nn.Linear(in_channels, heads * out_channels)
@@ -125,8 +134,20 @@ class RelationalGATv3Conv(MessagePassing):
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_normal_(layer.weight, gain=gain * 0.1)
 
-    def forward(self, x, edge_index, edge_attr=None, seq_features=None, plddt_features=None):
-        """Forward pass."""
+    def forward(self, x, edge_index, edge_attr=None, seq_features=None, plddt_features=None,
+                plddt_raw=None):
+        """Forward pass.
+
+        Args:
+            x: node features [N, in_channels].
+            edge_index: edge index [2, E].
+            edge_attr: edge features.
+            seq_features: optional sequence guidance per node (for seq_bias).
+            plddt_features: optional projected pLDDT used as attention bias (baseline 3).
+            plddt_raw: optional raw per-node pLDDT in [0, 100]. When provided and
+                `use_conf_gate=True`, the sender-side confidence gate is applied
+                to both attention logits (as additive log-bias) and message values.
+        """
         # Project inputs into query, key, and value spaces for each head
         query = self.lin_query(x).view(-1, self.heads, self.out_channels)
         key = self.lin_key(x).view(-1, self.heads, self.out_channels)
@@ -135,7 +156,8 @@ class RelationalGATv3Conv(MessagePassing):
         # Start message passing
         out = self.propagate(edge_index, query=query, key=key, value=value,
                              edge_attr=edge_attr, seq_features=seq_features,
-                             plddt_features=plddt_features)
+                             plddt_features=plddt_features,
+                             plddt_raw=plddt_raw)
 
         # Concatenate or average the outputs of the attention heads
         if self.concat:
@@ -146,7 +168,8 @@ class RelationalGATv3Conv(MessagePassing):
         return out
 
     def message(self, query_i, key_j, value_j, edge_attr, seq_features_i, seq_features_j,
-                index, plddt_features_i=None, plddt_features_j=None):
+                index, plddt_features_i=None, plddt_features_j=None,
+                plddt_raw_j=None):
         """Computes messages and attention weights for each edge."""
         # 1. Calculate raw attention scores
         scale = self.out_channels ** 0.5
@@ -176,12 +199,29 @@ class RelationalGATv3Conv(MessagePassing):
             plddt_bias = self.plddt_bias_processor(plddt_features_i)
             attention_logits = attention_logits + 0.1 * plddt_bias
 
-        # 5. Apply temperature and compute attention weights
+        # 5. Sender-side confidence gate (NEW): suppress messages from low-pLDDT residues.
+        sender_conf = None
+        if self.use_conf_gate and plddt_raw_j is not None:
+            plddt_j = plddt_raw_j
+            if plddt_j.dim() > 1:
+                plddt_j = plddt_j.view(-1)
+            sender_conf = torch.sigmoid((plddt_j - self.conf_gate_threshold) / self.conf_gate_slope)
+            sender_conf = sender_conf.clamp(min=1e-3, max=1.0)
+            # Add log-bias to attention logits (sign-correct suppression).
+            log_bias = torch.log(sender_conf + 1e-6).unsqueeze(-1)  # [E, 1]
+            attention_logits = attention_logits + log_bias
+
+        # 6. Apply temperature and compute attention weights
         attention_weights = custom_grouped_softmax(attention_logits / self.temperature, index)
         attention_weights = self.attn_dropout(attention_weights)
 
-        # 6. Weight values by attention and return as messages
-        return value_j * attention_weights.unsqueeze(-1)
+        # 7. Weight values by attention; additionally damp message magnitude when
+        #    sender confidence is low so that the propagated value cannot dominate
+        #    even after softmax renormalisation.
+        msg = value_j * attention_weights.unsqueeze(-1)
+        if sender_conf is not None:
+            msg = msg * sender_conf.view(-1, 1, 1)
+        return msg
 
     def update_temperature(self, new_temperature: float):
         """Updates the temperature parameter."""
@@ -193,7 +233,8 @@ class RGATv3Block(nn.Module):
     A complete RGATv3 block, including LayerNorm and residual connections.
     """
     def __init__(self, in_channels, out_channels, heads=8, dropout=0.3, edge_dim=None,
-                 temperature=1.0, seq_bias_dim=None, plddt_bias_dim=None):
+                 temperature=1.0, seq_bias_dim=None, plddt_bias_dim=None,
+                 use_conf_gate=True, conf_gate_threshold=50.0, conf_gate_slope=10.0):
         super(RGATv3Block, self).__init__()
 
         self.norm = nn.LayerNorm(in_channels)
@@ -212,13 +253,17 @@ class RGATv3Block(nn.Module):
             concat=True,
             temperature=temperature,
             seq_bias_dim=seq_bias_dim,
-            plddt_bias_dim=plddt_bias_dim
+            plddt_bias_dim=plddt_bias_dim,
+            use_conf_gate=use_conf_gate,
+            conf_gate_threshold=conf_gate_threshold,
+            conf_gate_slope=conf_gate_slope,
         )
 
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, edge_index, edge_attr=None, seq_features=None, plddt_features=None):
+    def forward(self, x, edge_index, edge_attr=None, seq_features=None, plddt_features=None,
+                plddt_raw=None):
         """Forward pass for the block."""
         identity = x
 
@@ -227,7 +272,8 @@ class RGATv3Block(nn.Module):
 
         # GATv3 convolution
         x = self.gatv3(x, edge_index, edge_attr=edge_attr,
-                       seq_features=seq_features, plddt_features=plddt_features)
+                       seq_features=seq_features, plddt_features=plddt_features,
+                       plddt_raw=plddt_raw)
 
         x = self.gelu(x)
         x = self.dropout(x)

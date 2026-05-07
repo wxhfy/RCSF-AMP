@@ -1,5 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.utils import get_laplacian, to_dense_batch
 
 # Ensure mamba_ssm is installed
@@ -243,12 +246,30 @@ class TransformerLayer(nn.Module):
 
 
 class PLDDTGating(nn.Module):
-    """Confidence gate that blends structure and sequence streams using pLDDT."""
+    """Monotone-prior confidence gate that blends structure and sequence streams using pLDDT.
 
-    def __init__(self, feature_dim):
+    The gate is anchored at AlphaFold's standard confidence threshold (pLDDT=70):
+    high pLDDT residues route information from the structural stream, low pLDDT
+    residues fall back to the sequence stream. Threshold and slope are learnable
+    but constrained by strong priors so the gate cannot collapse to a constant.
+    """
+
+    def __init__(self, feature_dim, init_threshold=70.0, init_slope=10.0, gate_min=0.05):
         super().__init__()
-        self.gate_projection = nn.Linear(1, feature_dim)
-        self.sigmoid = nn.Sigmoid()
+        self.feature_dim = feature_dim
+        self.init_threshold = float(init_threshold)
+        self.gate_min = float(gate_min)
+        # Learnable threshold offset, clamped via tanh to stay near AF2 convention.
+        self.delta_t_raw = nn.Parameter(torch.zeros(1))
+        # Learnable slope, kept positive via softplus + 5 so the sigmoid never goes too sharp.
+        # Initialize raw_slope so softplus(raw_slope) + 5 ≈ init_slope.
+        target_softplus = max(init_slope - 5.0, 1e-3)
+        init_raw = math.log(math.expm1(target_softplus)) if target_softplus > 0 else 0.0
+        self.raw_slope = nn.Parameter(torch.full((1,), float(init_raw)))
+        # Per-channel modulation around the scalar gate (kept small).
+        self.channel_bias = nn.Parameter(torch.zeros(feature_dim))
+        # Cache for the most recent gate, exposed for diagnostics + monotonicity loss.
+        self._last_gate_scalar = None
 
     def forward(self, struct_feats, seq_feats, plddt):
         """Fuse structure and sequence features based on pLDDT confidence.
@@ -256,18 +277,29 @@ class PLDDTGating(nn.Module):
         Args:
             struct_feats (torch.Tensor): Structure features [N, feature_dim].
             seq_feats (torch.Tensor): Sequence features [N, feature_dim].
-            plddt (torch.Tensor): Raw pLDDT scores [N] or [N, 1].
+            plddt (torch.Tensor): Raw pLDDT scores [N] or [N, 1] in [0, 100].
 
         Returns:
-            torch.Tensor: Weighted sum of the two feature streams.
+            torch.Tensor: Per-residue convex blend of the two streams.
         """
         if plddt.dim() == 1:
             plddt = plddt.unsqueeze(-1)
 
-        normalized_plddt = plddt / 100.0
-        gate = self.sigmoid(self.gate_projection(normalized_plddt))
+        delta_t = 10.0 * torch.tanh(self.delta_t_raw)
+        threshold = self.init_threshold + delta_t
+        slope = F.softplus(self.raw_slope) + 5.0
 
-        return (gate * struct_feats) + ((1.0 - gate) * seq_feats)
+        scalar_gate = torch.sigmoid((plddt - threshold) / slope)
+        scalar_gate = self.gate_min + (1.0 - self.gate_min) * scalar_gate
+
+        channel_mod = 1.0 + 0.1 * torch.tanh(self.channel_bias)
+        gate = scalar_gate * channel_mod
+        gate = gate.clamp(min=0.0, max=1.0)
+
+        # Cache scalar gate (per-residue, before per-channel mod) for diagnostics.
+        self._last_gate_scalar = scalar_gate.detach()
+
+        return gate * struct_feats + (1.0 - gate) * seq_feats
 
 
 class SimpleConfGatedFusion(nn.Module):

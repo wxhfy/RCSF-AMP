@@ -20,12 +20,14 @@ Control Variables:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from torch_geometric.utils import to_dense_batch
+from torch_scatter import scatter_mean
 
 from .esm_projection_head import ESMProjectionHead
 from .relational_gvp import RGVPEncoder
 from .relational_gatv3 import RGATv3Block
-from .fusion_mechanisms import CrossAttention
+from .fusion_mechanisms import CrossAttention, SCGCCrossAttention
 from .pooling_layers import GlobalPooling
 from .amp_multimodal_model import StructuralFeatureProjection, ActivityHead
 from .sucf_components import (
@@ -56,6 +58,12 @@ class SUCFCleanAblation(nn.Module):
                  use_plddt_node_feature=False,  # Baseline 1: pLDDT as additive feature before RGAT
                  use_simple_conf_gated_fusion=False,  # Baseline 2: direct conf-weighted gating (no cross-attention)
                  use_plddt_attention_bias=False,  # Baseline 3: pLDDT bias in RGAT attention
+                 # End-to-end confidence pipeline switches (default ON; turned OFF
+                 # together with `use_plddt_gate` so the wo_plddt_gate ablation
+                 # truly cuts the entire confidence-aware story).
+                 use_rgat_conf_gate=True,
+                 use_scgc_conf_aware=True,
+                 use_sgfn_conf_aware=True,
                  ):
         super().__init__()
         self.config = config
@@ -73,6 +81,11 @@ class SUCFCleanAblation(nn.Module):
         self.use_plddt_node_feature = use_plddt_node_feature
         self.use_simple_conf_gated_fusion = use_simple_conf_gated_fusion
         self.use_plddt_attention_bias = use_plddt_attention_bias
+        # Confidence-pipeline switches (gated by `use_plddt_gate` so wo_plddt_gate
+        # cuts the entire pipeline as the paper narrative claims).
+        self.use_rgat_conf_gate = bool(use_rgat_conf_gate) and bool(use_plddt_gate)
+        self.use_scgc_conf_aware = bool(use_scgc_conf_aware) and bool(use_plddt_gate)
+        self.use_sgfn_conf_aware = bool(use_sgfn_conf_aware) and bool(use_plddt_gate)
 
         # Architecture config
         arch_config = config.get('architecture', {})
@@ -181,7 +194,8 @@ class SUCFCleanAblation(nn.Module):
                 dropout=self.dropout,
                 edge_dim=self.edge_scalar_dim,
                 seq_bias_dim=seq_bias_dim,
-                plddt_bias_dim=plddt_bias_dim
+                plddt_bias_dim=plddt_bias_dim,
+                use_conf_gate=self.use_rgat_conf_gate,
             )
             self.structure_mapper.append(rgat_layer)
 
@@ -211,17 +225,34 @@ class SUCFCleanAblation(nn.Module):
             self.seq_refiner = None
             self.seq_gate = None
         elif self.use_scgc and self.use_structure:
-            # Standard SCGC: cross-attention + GRU gate
-            self.seq_refiner = CrossAttention(
-                hidden_dim=self.hidden_dim,
-                num_heads=self.cross_attention_heads,
-                dropout=self.dropout
-            )
+            # Standard SCGC: confidence-aware cross-attention + GRU gate.
+            # When the confidence pipeline is on, sequence attends to structure
+            # with low-pLDDT keys actively suppressed (additive log-bias).
+            if self.use_scgc_conf_aware:
+                self.seq_refiner = SCGCCrossAttention(
+                    hidden_dim=self.hidden_dim,
+                    num_heads=self.cross_attention_heads,
+                    dropout=self.dropout,
+                )
+            else:
+                self.seq_refiner = CrossAttention(
+                    hidden_dim=self.hidden_dim,
+                    num_heads=self.cross_attention_heads,
+                    dropout=self.dropout,
+                )
             self.seq_gate = GRUGate(
                 state_dim=self.hidden_dim,
                 input_dim=self.hidden_dim
             )
             self.simple_conf_gate = None
+            # Round 7: SCGC mid-bin peaked + disagreement trigger.
+            # Replaces the always-on calibration with a specialist that fires
+            # mainly in the ambiguous-quality region (pLDDT~70) when seq and
+            # struct disagree. Outside the mid bin, refined_seq decays toward
+            # seq_emb so SCGC behaves as identity in low/high bins.
+            self.scgc_mu_mid = nn.Parameter(torch.tensor(0.70))     # plddt-normalised peak
+            self.scgc_log_sigma_mid = nn.Parameter(torch.tensor(math.log(0.15)))
+            self.scgc_beta = nn.Parameter(torch.tensor(1.0))         # strength scaling
         else:
             self.seq_refiner = None
             self.seq_gate = None
@@ -229,11 +260,22 @@ class SUCFCleanAblation(nn.Module):
 
     def _build_final_fusion(self):
         """Build final fusion layer (struct_checker + Bi-Mamba or alternatives)."""
-        self.struct_checker = CrossAttention(
-            hidden_dim=self.hidden_dim,
-            num_heads=self.cross_attention_heads,
-            dropout=self.dropout
-        )
+        # SGFN structural checker: confidence-aware cross-attention with the
+        # *neighbour-averaged* pLDDT signal so its confidence cue is orthogonal
+        # to the per-residue pLDDT used by `PLDDTGating`. When the confidence
+        # pipeline is off (wo_plddt_gate ablation), fall back to plain attention.
+        if self.use_sgfn_conf_aware:
+            self.struct_checker = SCGCCrossAttention(
+                hidden_dim=self.hidden_dim,
+                num_heads=self.cross_attention_heads,
+                dropout=self.dropout,
+            )
+        else:
+            self.struct_checker = CrossAttention(
+                hidden_dim=self.hidden_dim,
+                num_heads=self.cross_attention_heads,
+                dropout=self.dropout,
+            )
 
         if self.use_bimamba:
             self.mamba_layer = MambaLayer(
@@ -244,6 +286,35 @@ class SUCFCleanAblation(nn.Module):
             )
         else:
             self.mamba_layer = None
+
+        # Reliability projector for Bi-Mamba residual (Fix 5; Round 7 redesign).
+        # Round 7 decomposition: reliability = q_prior(monotone) * c_resid(MLP).
+        #   q_prior(plddt) = sigmoid(scale * (plddt_norm - bias)) -- enforces
+        #     monotonicity in pLDDT so high-quality residues always get more
+        #     long-range context, eliminating the round-6 reliability inversion.
+        #   c_resid(cos_align, mean_gate, neighbour_conf) ∈ (0, 1) acts as a
+        #     bounded compatibility residual that can only modulate, never flip,
+        #     the prior.
+        # Inputs to c_resid_mlp: [mean_gate_i, cos(seq, struct)_i, neighbour_conf_i]
+        self.reliability_q_scale = nn.Parameter(torch.tensor(8.0))
+        self.reliability_q_bias = nn.Parameter(torch.tensor(0.7))  # plddt-normalised
+        self.reliability_mlp = nn.Sequential(  # role: c_resid for reliability
+            nn.Linear(3, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid(),
+        )
+        # Mixing coefficient between Mamba output and pre-Mamba combined features
+        # so the model can fall back to the un-Mambaed concat stream at low
+        # reliability without re-using the raw pLDDT signal twice.
+        # Round 7: alpha shares the same q_prior to keep both routing paths
+        # quality-monotone; the MLP only learns the compatibility residual.
+        self.alpha_proj = nn.Sequential(  # role: c_resid for alpha
+            nn.Linear(3, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid(),
+        )
 
         self.final_projection = nn.Sequential(
             nn.Linear(self.hidden_dim * 3, self.hidden_dim),
@@ -257,6 +328,25 @@ class SUCFCleanAblation(nn.Module):
             num_heads=8,
             num_inducing=16,
             dropout=self.dropout
+        )
+        # Round 7: graph-quality 3-expert router for the final fusion.
+        # Inputs (per-graph): [mean_plddt_norm, frac_plddt_lt70, var_plddt_norm].
+        # Outputs (per-graph): softmax weights over three node-level experts:
+        #   * E_seq    — sequence-only stream            (low-quality regime)
+        #   * E_mid    — seq + pLDDT-gated structure     (mid-quality regime)
+        #   * E_high   — seq + checked struct + mamba    (high-quality regime)
+        # The router is small to avoid overfitting on graph-level signals.
+        self.quality_router = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.GELU(),
+            nn.Linear(16, 3),
+        )
+        # Node-level projections for the balanced (E_mid) expert.
+        # E_seq reuses seq_emb_1 directly; E_high reuses fused_node_embedding.
+        self.expert_balanced_proj = nn.Sequential(
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.Dropout(self.dropout),
         )
         self.activity_predictor = ActivityHead(
             input_dim=self.hidden_dim,
@@ -320,13 +410,19 @@ class SUCFCleanAblation(nn.Module):
             else:
                 plddt_proj = data.plddt if self.use_plddt_attention_bias else None
 
+            # Raw pLDDT passed into RGAT for sender-side confidence gating.
+            # Setting to None when use_rgat_conf_gate is False fully cuts the
+            # confidence pipeline (used by `wo_plddt_gate` ablation).
+            rgat_plddt_raw = data.plddt if self.use_rgat_conf_gate else None
+
             for rgat_layer in self.structure_mapper:
                 raw_struct_map = rgat_layer(
                     x=raw_struct_map,
                     edge_index=data.edge_index,
                     edge_attr=data.edge_attr,
                     seq_features=seq_emb if self.use_seq_guide else None,
-                    plddt_features=plddt_proj
+                    plddt_features=plddt_proj,
+                    plddt_raw=rgat_plddt_raw,
                 )
         else:
             raw_struct_map = torch.zeros_like(seq_emb)
@@ -338,19 +434,70 @@ class SUCFCleanAblation(nn.Module):
                 seq_feats=seq_emb,
                 plddt=data.plddt
             )
+            gate_per_residue = self.plddt_gating._last_gate_scalar  # [N, 1]
         else:
             struct_map = raw_struct_map if self.use_structure else torch.zeros_like(seq_emb)
+            gate_per_residue = None
+
+        # Pre-compute neighbour-averaged confidence (used by SGFN + reliability MLP).
+        if self.use_structure:
+            try:
+                neighbour_plddt = scatter_mean(
+                    data.plddt[data.edge_index[0]],
+                    data.edge_index[1],
+                    dim=0,
+                    dim_size=data.plddt.size(0),
+                )
+                # Nodes with no incoming edges fall back to their own pLDDT.
+                no_neighbour_mask = neighbour_plddt == 0
+                if no_neighbour_mask.any():
+                    neighbour_plddt = torch.where(no_neighbour_mask, data.plddt, neighbour_plddt)
+            except Exception:
+                neighbour_plddt = data.plddt
+        else:
+            neighbour_plddt = None
 
         # === 5. Sequence Refinement (SCGC or Baseline 2) ===
+        # Round 7: SCGC is reformulated as a mid-bin peaked + disagreement-
+        # triggered specialist. The cross-attention output (refined_seq) is
+        # mixed with the raw seq_emb by a per-residue strength factor that
+        # peaks in the ambiguous-quality bin and only fires when seq/struct
+        # disagree. Outside the mid bin or under high agreement, SCGC decays
+        # to identity, leaving the full's low-bin role to the gate and the
+        # high-bin role to Bi-Mamba.
+        scgc_strength = None
         if self.use_structure:
             if self.use_scgc and self.seq_refiner is not None:
-                # Standard SCGC: structure attends to sequence via cross-attention
-                refined_seq = self.seq_refiner(
-                    query=seq_emb,
-                    key_value=struct_map,
-                    query_batch=batch_index,
-                    key_value_batch=batch_index
-                )
+                # SCGC: sequence query attends to (calibrated) structure key,
+                # with low-pLDDT structural keys actively suppressed when
+                # confidence-aware variant is enabled.
+                if isinstance(self.seq_refiner, SCGCCrossAttention) and self.use_scgc_conf_aware:
+                    refined_seq = self.seq_refiner(
+                        query=seq_emb,
+                        key_value=struct_map,
+                        query_batch=batch_index,
+                        key_value_batch=batch_index,
+                        plddt_key=data.plddt,
+                    )
+                else:
+                    refined_seq = self.seq_refiner(
+                        query=seq_emb,
+                        key_value=struct_map,
+                        query_batch=batch_index,
+                        key_value_batch=batch_index,
+                    )
+
+                # Round 7: mid-bin peaked + disagreement-triggered strength.
+                plddt_norm = (data.plddt / 100.0).clamp(0.0, 1.0)            # [N]
+                sigma_mid = self.scgc_log_sigma_mid.exp().clamp(min=0.05, max=0.5)
+                g_mid = torch.exp(-((plddt_norm - self.scgc_mu_mid) ** 2) / (2.0 * sigma_mid ** 2))  # [N]
+                # Detach the trigger so SCGC cannot game its own activation.
+                cos_sd = F.cosine_similarity(seq_emb, struct_map, dim=-1).clamp(-1.0, 1.0).detach()
+                disagreement = (1.0 - cos_sd).clamp(0.0, 2.0)                # [N]
+                # sigmoid(beta) keeps strength bounded; init beta=1 ⇒ ~0.73.
+                scgc_strength = (g_mid * disagreement * torch.sigmoid(self.scgc_beta)).unsqueeze(-1)  # [N, 1]
+                refined_seq = scgc_strength * refined_seq + (1.0 - scgc_strength) * seq_emb
+
                 seq_emb_1 = self.seq_gate(state=seq_emb, input_features=refined_seq)
             elif self.use_simple_conf_gated_fusion and self.simple_conf_gate is not None:
                 # Baseline 2: direct pLDDT-weighted fusion (no cross-attention)
@@ -361,71 +508,212 @@ class SUCFCleanAblation(nn.Module):
             seq_emb_1 = seq_emb
 
         # === 6. Final Fusion ===
+        # FIX: Use struct_map (pLDDT-gated, RGAT-processed) as the structural stream,
+        #      not raw struct_emb. This ensures earlier modules' outputs flow into fusion.
+        # FIX: SGFN now refines struct_map (calibrated structure) using SCGC-calibrated seq.
+        # FIX: When use_sgfn=False, checked_struct uses identity (struct_map) instead of
+        #      duplicating raw struct_emb, eliminating the redundant-stream artifact.
+        # FIX (round 6): SGFN uses neighbour-averaged pLDDT as its confidence cue so
+        #      the SGFN signal is orthogonal to the per-residue pLDDT used by the gate
+        #      module — keeps each module non-redundant.
+        if self.use_structure:
+            structural_stream = struct_map  # pLDDT-gated + RGAT-processed
+        else:
+            structural_stream = torch.zeros_like(seq_emb_1)
+
+        sgfn_conf_key = neighbour_plddt if (
+            self.use_structure and self.use_sgfn_conf_aware and isinstance(self.struct_checker, SCGCCrossAttention)
+        ) else None
+
         if self.calibration_order == 'calibrate_then_fuse':
             # Standard: calibrate structure then fuse
+            checked_struct = structural_stream  # default identity
             if self.use_structure and self.use_sgfn:
-                # SGFN: cross-attention refines structure using calibrated sequence as query
-                checked_struct = self.struct_checker(
-                    query=seq_emb_1,
-                    key_value=struct_emb,
-                    query_batch=batch_index,
-                    key_value_batch=batch_index
-                )
+                if sgfn_conf_key is not None:
+                    checked_struct = self.struct_checker(
+                        query=seq_emb_1,
+                        key_value=struct_map,
+                        query_batch=batch_index,
+                        key_value_batch=batch_index,
+                        plddt_key=sgfn_conf_key,
+                    )
+                else:
+                    checked_struct = self.struct_checker(
+                        query=seq_emb_1,
+                        key_value=struct_map,
+                        query_batch=batch_index,
+                        key_value_batch=batch_index,
+                    )
             elif self.use_structure:
-                # use_sgfn=False -> simple concat baseline: replace SGFN-refined stream
-                # with raw structure features (mirrors fuse_then_calibrate concat path)
-                checked_struct = struct_emb
+                checked_struct = structural_stream
             else:
                 checked_struct = torch.zeros_like(seq_emb_1)
 
             combined_features = torch.cat([
-                struct_emb if self.use_structure else seq_emb_1,
+                structural_stream,
                 seq_emb_1,
-                checked_struct
+                checked_struct,
             ], dim=-1)
 
         else:  # fuse_then_calibrate
-            # Alternative: fuse first, then apply structure guidance
+            checked_struct = structural_stream
             if self.fusion_type == 'concat':
-                # Simple concat fusion
                 combined_features = torch.cat([
-                    struct_emb if self.use_structure else seq_emb_1,
+                    structural_stream,
                     seq_emb_1,
-                    struct_emb if self.use_structure else seq_emb_1
+                    structural_stream,
                 ], dim=-1)
             else:
-                # SGFN fusion
                 if self.use_structure:
-                    checked_struct = self.struct_checker(
-                        query=seq_emb_1,
-                        key_value=struct_emb,
-                        query_batch=batch_index,
-                        key_value_batch=batch_index
-                    )
+                    if sgfn_conf_key is not None:
+                        checked_struct = self.struct_checker(
+                            query=seq_emb_1,
+                            key_value=struct_map,
+                            query_batch=batch_index,
+                            key_value_batch=batch_index,
+                            plddt_key=sgfn_conf_key,
+                        )
+                    else:
+                        checked_struct = self.struct_checker(
+                            query=seq_emb_1,
+                            key_value=struct_map,
+                            query_batch=batch_index,
+                            key_value_batch=batch_index,
+                        )
                 else:
                     checked_struct = torch.zeros_like(seq_emb_1)
                 combined_features = torch.cat([
-                    struct_emb if self.use_structure else seq_emb_1,
+                    structural_stream,
                     seq_emb_1,
-                    checked_struct
+                    checked_struct,
                 ], dim=-1)
 
-        # === 7. Context Modeling (Bi-Mamba or alternative) ===
-        if self.use_bimamba and self.mamba_layer is not None:
-            fused_features = self.mamba_layer(combined_features, batch=data.batch)
+        # === 6.5 Reliability scoring (drives Bi-Mamba residual, Round 7 redesign) ===
+        # Round 7: reliability = q_prior(plddt_per_residue) * c_resid([mean_gate, cos_align, neighbour_conf])
+        #   - q_prior is a learnable monotone sigmoid in pLDDT (eliminates the
+        #     round-6 reliability inversion where low-pLDDT residues received
+        #     higher reliability than high-pLDDT ones).
+        #   - c_resid is a bounded MLP that can only modulate, never flip, the
+        #     monotone prior.
+        # Three orthogonal signals feeding c_resid:
+        #   * mean_gate     — pLDDTGating's per-residue scalar gate
+        #   * cos_align     — cosine similarity between calibrated seq and struct
+        #   * neighbour_conf — locally-averaged pLDDT (graph-smoothed)
+        if self.use_structure and gate_per_residue is not None and neighbour_plddt is not None:
+            mean_gate = gate_per_residue.view(-1, 1)
+            cos_align = F.cosine_similarity(seq_emb_1, struct_map, dim=-1).unsqueeze(-1)
+            neighbour_conf = (neighbour_plddt / 100.0).clamp(0.0, 1.0).unsqueeze(-1)
+            reliability_in = torch.cat([mean_gate, cos_align, neighbour_conf], dim=-1)  # [N, 3]
+
+            plddt_norm = (data.plddt / 100.0).clamp(0.0, 1.0).unsqueeze(-1)              # [N, 1]
+            q_prior = torch.sigmoid(self.reliability_q_scale * (plddt_norm - self.reliability_q_bias))  # [N, 1]
+            c_resid_r = self.reliability_mlp(reliability_in)                              # [N, 1] ∈ (0, 1)
+            c_resid_a = self.alpha_proj(reliability_in)                                   # [N, 1] ∈ (0, 1)
+
+            reliability = q_prior * c_resid_r        # [N, 1] monotone in plddt
+            alpha = q_prior * c_resid_a              # [N, 1] monotone in plddt
         else:
-            fused_features = combined_features
+            reliability_in = None
+            reliability = None
+            alpha = None
+
+        # === 7. Context Modeling (Bi-Mamba with reliability-aware residual) ===
+        # Round 7 v2 fix: apply reliability damping to the structural sub-streams
+        # UNCONDITIONALLY (independent of `use_bimamba`). Previously the damping
+        # was tied to the mamba branch, which meant `wo_bimamba` quietly removed
+        # BOTH the long-range scan AND the noise-gated residual stream — turning
+        # the ablation into a smaller, less-regularised model that occasionally
+        # generalised better (e.g. seed-123 outlier 0.7600). After the fix,
+        # `wo_bimamba` is a clean removal of the long-range scan only; every
+        # ablation receives the same reliability prior so the comparison is
+        # apples-to-apples.
+        if reliability is not None:
+            struct_slice = combined_features[..., :self.hidden_dim] * reliability
+            seq_slice = combined_features[..., self.hidden_dim:2 * self.hidden_dim]
+            checked_slice = combined_features[..., 2 * self.hidden_dim:] * reliability
+            damped_features = torch.cat([struct_slice, seq_slice, checked_slice], dim=-1)
+        else:
+            damped_features = combined_features
+
+        if self.use_bimamba and self.mamba_layer is not None:
+            mamba_out = self.mamba_layer(damped_features, batch=data.batch)
+            if alpha is not None:
+                fused_features = alpha * mamba_out + (1.0 - alpha) * damped_features
+            else:
+                fused_features = mamba_out
+        else:
+            fused_features = damped_features
 
         fused_node_embedding = self.final_projection(fused_features)
-        global_embedding = self.global_pooling(fused_node_embedding, data.batch)
+
+        # === 8. Quality-routed Fusion (Round 7) ===
+        # Three node-level experts pooled independently; a graph-level router
+        # decides how to mix them based on the graph's pLDDT statistics. This
+        # gives Fusion an explicit specialization story (E_seq -> low,
+        # E_mid -> mid, E_high -> high), removing the round-6 reliance on a
+        # single black-box concat MLP.
+        if self.use_structure:
+            node_balanced = self.expert_balanced_proj(
+                torch.cat([seq_emb_1, struct_map], dim=-1)
+            )
+        else:
+            node_balanced = seq_emb_1
+
+        z_seq = self.global_pooling(seq_emb_1, data.batch)
+        z_mid = self.global_pooling(node_balanced, data.batch)
+        z_high = self.global_pooling(fused_node_embedding, data.batch)
+
+        if self.use_structure:
+            # Per-graph pLDDT statistics in [0, 1] / [0, 1] / [0, 1] ranges so
+            # the router input lives on a comparable scale.
+            plddt_norm_pr = (data.plddt / 100.0).clamp(0.0, 1.0)
+            graph_mean = scatter_mean(plddt_norm_pr, data.batch, dim=0)                       # [B]
+            graph_low = scatter_mean((plddt_norm_pr < 0.7).float(), data.batch, dim=0)        # [B]
+            graph_sq = scatter_mean(plddt_norm_pr ** 2, data.batch, dim=0)
+            graph_var = (graph_sq - graph_mean ** 2).clamp(min=0.0)                           # [B]
+            graph_q = torch.stack([graph_mean, graph_low, graph_var], dim=-1)                 # [B, 3]
+            router_logits = self.quality_router(graph_q)
+            w = F.softmax(router_logits, dim=-1)                                              # [B, 3]
+        else:
+            # Without structure all experts collapse to the seq stream.
+            B = z_seq.size(0)
+            w = torch.tensor([1.0, 0.0, 0.0], device=z_seq.device).expand(B, 3)
+            router_logits = None
+
+        global_embedding = (
+            w[:, 0:1] * z_seq
+            + w[:, 1:2] * z_mid
+            + w[:, 2:3] * z_high
+        )
         activity_pred = self.activity_predictor(global_embedding)
 
+        # FIX v2 (Codex Round 5): unify Stage1 alignment anchor across
+        # ablations to keep the contrastive objective fair. The anchor is
+        # always the structural stream that feeds the final fusion:
+        #   * with SGFN  -> checked_struct (cross-modal refined)
+        #   * without SGFN -> structural_stream (identity passthrough)
+        # This way every ablation aligns against its own "final structure
+        # representation"; sgfn_concat is no longer penalized by a missing
+        # second anchor.
+        if self.use_structure:
+            struct_anchor = checked_struct
+        else:
+            struct_anchor = structural_stream  # zeros when wo_structure
         return {
             'activity_pred': activity_pred,
             'seq_global': self.global_pooling(seq_emb_1, data.batch),
-            'struct_global': self.global_pooling(struct_emb, data.batch),
+            'struct_global': self.global_pooling(struct_anchor, data.batch),
+            # raw RGVP+pos-enc retained for P0-1 perturbation diagnostics
+            'struct_raw_global': self.global_pooling(struct_emb, data.batch),
             'combined_global': global_embedding,
             'fused_node_features': fused_node_embedding,
+            # Per-residue scalar gate + pLDDT for diagnostics + monotonicity loss.
+            'gate_per_residue': gate_per_residue,
+            'plddt_per_residue': data.plddt if self.use_structure else None,
+            'reliability_per_residue': reliability,
+            # Round 7 diagnostics
+            'scgc_strength_per_residue': scgc_strength,
+            'router_weights_per_graph': w if self.use_structure else None,
         }
 
 

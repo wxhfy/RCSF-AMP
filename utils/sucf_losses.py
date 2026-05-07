@@ -104,6 +104,74 @@ class SupervisedContrastiveLoss(nn.Module):
         return loss
 
 
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance and hard example mining.
+    FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
+    """
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        probs = torch.sigmoid(inputs)
+        pt = torch.where(targets == 1, probs, 1 - probs)
+        focal_weight = (1 - pt) ** self.gamma
+        alpha_t = torch.where(targets == 1, self.alpha, 1 - self.alpha)
+        loss = alpha_t * focal_weight * bce_loss
+        return loss.mean()
+
+
+class GateMonotonicityLoss(nn.Module):
+    """Encourages the pLDDT gate to be monotonically non-decreasing across pLDDT bins.
+
+    The gate is expected to be near 0 for very-low pLDDT (use sequence) and
+    near 1 for high pLDDT (use structure). A simple ReLU-margin loss penalises
+    cases where the bin-wise mean gate fails to increase by at least `margin`
+    between consecutive bins. This is a much safer regulariser than maximising
+    raw variance — it directly aligns the gate with the desired pLDDT-conditioned
+    behaviour and is robust to per-channel modulation.
+    """
+
+    DEFAULT_BINS = ((0.0, 50.0), (50.0, 70.0), (70.0, 90.0), (90.0, 101.0))
+
+    def __init__(self, margin: float = 0.05, bins=None):
+        super().__init__()
+        self.margin = float(margin)
+        self.bins = list(bins) if bins is not None else list(self.DEFAULT_BINS)
+
+    def forward(self, gate_per_residue, plddt):
+        """
+        Args:
+            gate_per_residue (torch.Tensor): Scalar gate per residue [N, 1] or [N].
+            plddt (torch.Tensor): Raw pLDDT per residue [N] or [N, 1].
+
+        Returns:
+            torch.Tensor: Scalar monotonicity loss.
+        """
+        if gate_per_residue is None or plddt is None:
+            return torch.tensor(0.0, device=plddt.device if plddt is not None else 'cpu')
+
+        gate_flat = gate_per_residue.view(-1)
+        plddt_flat = plddt.view(-1)
+
+        bin_means = []
+        for lo, hi in self.bins:
+            mask = (plddt_flat >= lo) & (plddt_flat < hi)
+            if mask.any():
+                bin_means.append(gate_flat[mask].mean())
+
+        if len(bin_means) < 2:
+            return torch.tensor(0.0, device=gate_flat.device)
+
+        means = torch.stack(bin_means)
+        diffs = means[1:] - means[:-1]
+        # Penalise any pair that does not rise by at least `margin`.
+        return F.relu(self.margin - diffs).mean()
+
+
 class SUCFTotalLoss(nn.Module):
     """
     Total loss function for the SUCF model, supporting dynamic weighting for two-stage training.
@@ -112,14 +180,32 @@ class SUCFTotalLoss(nn.Module):
         super().__init__()
         self.config = config
         loss_config = config.get('training', {}).get('loss_config', {})
-        
+
         # Initialize individual loss functions
-        self.activity_loss = nn.BCEWithLogitsLoss()
+        self.use_focal = loss_config.get('use_focal_loss', False)
+        self.use_class_weight = loss_config.get('use_class_weight', False)
+        self.pos_weight = loss_config.get('pos_weight', 1.0)
+        self.label_smoothing = loss_config.get('label_smoothing', 0.0)
+
+        if self.use_focal:
+            self.activity_loss = FocalLoss(
+                alpha=loss_config.get('focal_alpha', 0.25),
+                gamma=loss_config.get('focal_gamma', 2.0)
+            )
+            logger.info(f"Using Focal Loss (alpha={loss_config.get('focal_alpha', 0.25)}, gamma={loss_config.get('focal_gamma', 2.0)})")
+        elif self.use_class_weight:
+            self.activity_loss = None  # Will handle in forward with proper device
+            logger.info(f"Using Weighted BCE (pos_weight={self.pos_weight})")
+        else:
+            self.activity_loss = nn.BCEWithLogitsLoss()
         self.alignment_contrastive_loss = AlignmentContrastiveLoss(
             temperature=loss_config.get('alignment_contrastive_temperature', 0.1)
         )
         self.supervised_contrastive_loss = SupervisedContrastiveLoss(
             temperature=loss_config.get('supervised_contrastive_temperature', 0.07)
+        )
+        self.gate_monotonicity_loss = GateMonotonicityLoss(
+            margin=loss_config.get('gate_monotonicity_margin', 0.05)
         )
         logger.info("SUCF total loss function initialized.")
     
@@ -147,8 +233,19 @@ class SUCFTotalLoss(nn.Module):
         if 'activity' in active_losses:
             activity_pred = model_output['activity_pred'].squeeze()
             target_labels = targets.y.float()
-            
-            activity_loss_val = self.activity_loss(activity_pred, target_labels)
+
+            # Apply label smoothing if configured
+            if self.label_smoothing > 0:
+                target_labels = target_labels * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+
+            if self.use_class_weight:
+                # Weighted BCE with proper device placement
+                weight = torch.tensor([self.pos_weight], device=device)
+                activity_loss_val = F.binary_cross_entropy_with_logits(
+                    activity_pred, target_labels, pos_weight=weight
+                )
+            else:
+                activity_loss_val = self.activity_loss(activity_pred, target_labels)
             loss_dict['activity'] = activity_loss_val.item()
             total_loss += loss_weights.get('activity', 0.0) * activity_loss_val
         
@@ -156,8 +253,12 @@ class SUCFTotalLoss(nn.Module):
         if 'alignment_contrastive' in active_losses:
             seq_global = model_output.get('seq_global')
             struct_global = model_output.get('struct_global')
-            
+
             if seq_global is not None and struct_global is not None:
+                # Unified single-anchor InfoNCE: aligns calibrated sequence to
+                # the structural stream that actually feeds final fusion.  Same
+                # objective shape across all ablations -> fair comparison
+                # (Codex Round 5 fix).
                 alignment_loss_val = self.alignment_contrastive_loss(seq_global, struct_global)
                 loss_dict['alignment_contrastive'] = alignment_loss_val.item()
                 total_loss += loss_weights.get('alignment_contrastive', 0.0) * alignment_loss_val
@@ -173,7 +274,16 @@ class SUCFTotalLoss(nn.Module):
                 total_loss += loss_weights.get('supervised_contrastive', 0.0) * sup_contrastive_loss_val
             else:
                 logger.warning("Supervised contrastive loss requires 'combined_global' features.")
-        
+
+        # 4. Gate Monotonicity Regulariser
+        if 'gate_monotonicity' in active_losses:
+            gate_per_residue = model_output.get('gate_per_residue')
+            plddt_per_residue = model_output.get('plddt_per_residue')
+            if gate_per_residue is not None and plddt_per_residue is not None:
+                mono_loss_val = self.gate_monotonicity_loss(gate_per_residue, plddt_per_residue)
+                loss_dict['gate_monotonicity'] = mono_loss_val.item() if mono_loss_val.requires_grad or mono_loss_val.numel() > 0 else float(mono_loss_val)
+                total_loss += loss_weights.get('gate_monotonicity', 0.0) * mono_loss_val
+
         loss_dict['total_loss'] = total_loss
         return loss_dict
 
