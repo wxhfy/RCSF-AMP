@@ -623,6 +623,8 @@ class SUCFCleanAblation(nn.Module):
             reliability_in = None
             reliability = None
             alpha = None
+            c_resid_r = None
+            c_resid_a = None
 
         # === 7. Context Modeling (Bi-Mamba with reliability-aware residual) ===
         # Round 7 v2 fix: apply reliability damping to the structural sub-streams
@@ -645,7 +647,10 @@ class SUCFCleanAblation(nn.Module):
         if self.use_bimamba and self.mamba_layer is not None:
             mamba_out = self.mamba_layer(damped_features, batch=data.batch)
             if alpha is not None:
-                fused_features = alpha * mamba_out + (1.0 - alpha) * damped_features
+                # Round 9: halve alpha to reduce Bi-Mamba training variance.
+                # Full contribution range [0, 0.5] instead of [0, 1].
+                alpha_half = 0.5 * alpha
+                fused_features = alpha_half * mamba_out + (1.0 - alpha_half) * damped_features
             else:
                 fused_features = mamba_out
         else:
@@ -718,6 +723,9 @@ class SUCFCleanAblation(nn.Module):
             'gate_per_residue': gate_per_residue,
             'plddt_per_residue': data.plddt if self.use_structure else None,
             'reliability_per_residue': reliability,
+            # Round 9: expose c_resid for reliability regularisation loss.
+            'c_resid_r': c_resid_r,
+            'c_resid_a': c_resid_a,
             # Round 7 diagnostics
             'scgc_strength_per_residue': scgc_strength,
             'router_weights_per_graph': w if self.use_structure else None,

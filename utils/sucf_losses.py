@@ -172,6 +172,25 @@ class GateMonotonicityLoss(nn.Module):
         return F.relu(self.margin - diffs).mean()
 
 
+class ReliabilityRegularizationLoss(nn.Module):
+    """Encourages c_resid (MLP modulation) to stay close to 1.0 so the reliability
+    score closely follows the monotone q_prior. This prevents the MLP from learning
+    spurious patterns that break pLDDT monotonicity and introduce training variance.
+    """
+
+    def __init__(self, margin: float = 0.3):
+        super().__init__()
+        self.margin = float(margin)
+
+    def forward(self, c_resid_r, c_resid_a):
+        if c_resid_r is None or c_resid_a is None:
+            return torch.tensor(0.0)
+        # Penalise deviation from 1.0, but allow up to `margin` free.
+        loss_r = F.relu((1.0 - c_resid_r).abs() - self.margin).mean()
+        loss_a = F.relu((1.0 - c_resid_a).abs() - self.margin).mean()
+        return loss_r + loss_a
+
+
 class SUCFTotalLoss(nn.Module):
     """
     Total loss function for the SUCF model, supporting dynamic weighting for two-stage training.
@@ -206,6 +225,9 @@ class SUCFTotalLoss(nn.Module):
         )
         self.gate_monotonicity_loss = GateMonotonicityLoss(
             margin=loss_config.get('gate_monotonicity_margin', 0.05)
+        )
+        self.reliability_reg_loss = ReliabilityRegularizationLoss(
+            margin=loss_config.get('reliability_reg_margin', 0.3)
         )
         logger.info("SUCF total loss function initialized.")
     
@@ -283,6 +305,16 @@ class SUCFTotalLoss(nn.Module):
                 mono_loss_val = self.gate_monotonicity_loss(gate_per_residue, plddt_per_residue)
                 loss_dict['gate_monotonicity'] = mono_loss_val.item() if mono_loss_val.requires_grad or mono_loss_val.numel() > 0 else float(mono_loss_val)
                 total_loss += loss_weights.get('gate_monotonicity', 0.0) * mono_loss_val
+
+        # 5. Reliability Regularisation (Round 9): keep c_resid MLPs close to identity.
+        if 'reliability_reg' in active_losses:
+            c_resid_r = model_output.get('c_resid_r')
+            c_resid_a = model_output.get('c_resid_a')
+            if c_resid_r is not None and c_resid_a is not None:
+                reg_loss_val = self.reliability_reg_loss(c_resid_r, c_resid_a)
+                loss_dict['reliability_reg'] = (reg_loss_val.item() if hasattr(reg_loss_val, 'item')
+                                                else float(reg_loss_val))
+                total_loss += loss_weights.get('reliability_reg', 0.0) * reg_loss_val
 
         loss_dict['total_loss'] = total_loss
         return loss_dict

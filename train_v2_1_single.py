@@ -133,12 +133,13 @@ def main():
         # FIX (round 6): also include gate_monotonicity to prevent the pLDDT gate
         # from collapsing to a flat ~0.5 across all pLDDT (root cause of the
         # previous B2 ablation anomaly).
-        'active_losses': ['activity', 'supervised_contrastive', 'alignment_contrastive', 'gate_monotonicity'],
+        'active_losses': ['activity', 'supervised_contrastive', 'alignment_contrastive', 'gate_monotonicity', 'reliability_reg'],
         'loss_weights': {
             'activity': 1.0,
             'alignment_contrastive': 0.1,
             'supervised_contrastive': 0.5,
             'gate_monotonicity': 0.05,
+            'reliability_reg': 0.02,
         },
     }
 
