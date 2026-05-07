@@ -498,7 +498,14 @@ class SUCFCleanAblation(nn.Module):
                 scgc_strength = (g_mid * disagreement * torch.sigmoid(self.scgc_beta)).unsqueeze(-1)  # [N, 1]
                 refined_seq = scgc_strength * refined_seq + (1.0 - scgc_strength) * seq_emb
 
-                seq_emb_1 = self.seq_gate(state=seq_emb, input_features=refined_seq)
+                # Round 7 v2: drop the trailing GRUGate so the mid-peak strength
+                # is the *only* mixing knob between seq_emb and refined_seq.
+                # The previous GRU residual diluted SCGC's contribution in mid
+                # bin (hurt of wo_scgc collapsed to ≈0). After the fix,
+                # wo_scgc cleanly removes the calibration the model was actually
+                # using, so the per-bin specialisation table reflects what each
+                # module truly contributes.
+                seq_emb_1 = refined_seq
             elif self.use_simple_conf_gated_fusion and self.simple_conf_gate is not None:
                 # Baseline 2: direct pLDDT-weighted fusion (no cross-attention)
                 seq_emb_1 = self.simple_conf_gate(seq_emb, struct_map, data.plddt)
