@@ -93,7 +93,7 @@ class SUCFTrainer:
             desc=description,
             dynamic_ncols=True,
             mininterval=0.3,
-            file=sys.stdout,
+            file=sys.stderr,
             leave=False
         )
 
@@ -143,12 +143,32 @@ class SUCFTrainer:
     def _create_model(self):
         """Creates the SUCF model."""
         model_config = self.config.get('model', {})
-        model = create_sucf_model(model_config).to(self.device)
-        
+        arch_config = model_config.get('architecture', {})
+        ablation = arch_config.get('ablation', 'full')
+
+        # Map config ablation names to SUCFAblated internal names
+        ablation_name_map = {
+            'structure': 'wo_structure',
+            'mamba': 'wo_bimamba',
+            'scgc': 'wo_scgc',
+            'plddt_gate': 'wo_plddt_gate',
+            'sgfn_concat': 'sgfn_concat',
+        }
+        internal_ablation = ablation_name_map.get(ablation, ablation)
+
+        if internal_ablation and internal_ablation != 'full':
+            # Use ablated model
+            from ablation_complete import SUCFAblated
+            model = SUCFAblated(model_config, ablation=internal_ablation).to(self.device)
+            logger.info(f"Using SUCFAblated model with ablation='{internal_ablation}' (config: '{ablation}')")
+        else:
+            # Use full model
+            model = create_sucf_model(model_config).to(self.device)
+
         model_info = model.get_model_info()
         logger.info(f"Total model parameters: {model_info['total_params']:,}")
         logger.info(f"Trainable parameters: {model_info['trainable_params']:,}")
-        
+
         return model
     
     def _create_optimizer_and_scheduler(self, stage_config):
@@ -167,10 +187,26 @@ class SUCFTrainer:
         ]
         
         self.optimizer = torch.optim.AdamW(param_groups, weight_decay=self.config['training']['optimizer_params']['weight_decay'])
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=stage_config.get('epochs', 100), eta_min=default_lr * self.config['training']['scheduler_params']['min_lr_factor']
-        )
-        logger.info(f"Created Optimizer: AdamW, Default LR: {default_lr}, Head LR: {head_lr}")
+
+        # Get warmup settings
+        warmup_epochs = stage_config.get('warmup_epochs', 0)
+        if warmup_epochs > 0:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+            )
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=stage_config.get('epochs', 100) - warmup_epochs,
+                eta_min=default_lr * self.config['training']['scheduler_params']['min_lr_factor']
+            )
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
+            )
+            logger.info(f"Created Optimizer: AdamW, Default LR: {default_lr}, Head LR: {head_lr}, Warmup: {warmup_epochs} epochs")
+        else:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=stage_config.get('epochs', 100), eta_min=default_lr * self.config['training']['scheduler_params']['min_lr_factor']
+            )
+            logger.info(f"Created Optimizer: AdamW, Default LR: {default_lr}, Head LR: {head_lr}")
 
     def train_epoch(self, train_loader, stage_config):
         """Trains the model for one epoch."""

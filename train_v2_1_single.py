@@ -36,12 +36,14 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, is_toxin=False):
     model.eval()
     probs, targets = [], []
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
+            if is_toxin and hasattr(batch, 'toxicity_embedding'):
+                batch.amp_embedding = batch.toxicity_embedding
             out = model(batch)
             p = torch.sigmoid(out['activity_pred'].squeeze(-1)).cpu().numpy()
             t = batch.y.cpu().numpy()
@@ -54,7 +56,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ablation', required=True)
     parser.add_argument('--seed', type=int, required=True)
-    parser.add_argument('--benchmark', choices=['B1', 'B2'], required=True)
+    parser.add_argument('--benchmark', choices=['B1', 'B2', 'TOXIN', 'HEMOPI'], required=True)
     parser.add_argument('--device', required=True)
     parser.add_argument('--run_id', required=True)
     parser.add_argument('--s1_epochs', type=int, default=15)
@@ -67,6 +69,8 @@ def main():
     data_roots = {
         'B1': '/home/20T-1/fyh0106/compare/merged_amp_decoy/',
         'B2': '/home/20T-1/fyh0106/compare2/merged_amp_decoy/',
+        'TOXIN': '/home/20T-1/fyh0106/toxin_data/',
+        'HEMOPI': '/home/20T-1/fyh0106/hemopi_data/',
     }
     data_root = data_roots[args.benchmark]
 
@@ -79,6 +83,12 @@ def main():
                 old_path = extra_emb[key].get('path', '')
                 if 'compare' in old_path and 'compare2' not in old_path:
                     extra_emb[key]['path'] = old_path.replace('/compare/', '/compare2/')
+    if args.benchmark == 'TOXIN':
+        # Toxicity graphs have toxicity_embedding key; model expects amp_embedding
+        config['data']['extra_embeddings'] = {}
+    if args.benchmark == 'HEMOPI':
+        # HemoPI graphs have amp_embedding baked in; no extra embeddings needed
+        config['data']['extra_embeddings'] = {}
 
     out_dir = project_root / 'outputs' / 'clean_ablation_v2_1' / args.benchmark / args.run_id / args.ablation / f'seed{args.seed}'
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +106,7 @@ def main():
     train_loader = PyGDataLoader(train_ds, batch_size=64, shuffle=True, num_workers=2)
     val_loader = PyGDataLoader(val_ds, batch_size=64, shuffle=False, num_workers=2)
     test_loader = PyGDataLoader(test_ds, batch_size=64, shuffle=False, num_workers=2)
+    is_toxin = args.benchmark == 'TOXIN'
 
     # ============= Stage 1: Feature Alignment =============
     s1_lr = 2.27e-5
@@ -110,6 +121,8 @@ def main():
         model.train()
         for batch in train_loader:
             batch = batch.to(device)
+            if is_toxin and hasattr(batch, 'toxicity_embedding'):
+                batch.amp_embedding = batch.toxicity_embedding
             opt_s1.zero_grad()
             out = model(batch)
             loss_dict = loss_fn(out, batch, stage1_info)
@@ -152,6 +165,8 @@ def main():
         model.train()
         for batch in train_loader:
             batch = batch.to(device)
+            if is_toxin and hasattr(batch, 'toxicity_embedding'):
+                batch.amp_embedding = batch.toxicity_embedding
             opt_s2.zero_grad()
             out = model(batch)
             loss_dict = loss_fn(out, batch, stage2_info)
@@ -162,7 +177,7 @@ def main():
         sched.step()
         epochs_run += 1
 
-        val_metrics = evaluate(model, val_loader, device)
+        val_metrics = evaluate(model, val_loader, device, is_toxin)
         if val_metrics['mcc'] > best_val:
             best_val = val_metrics['mcc']
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -173,7 +188,7 @@ def main():
 
     # final test
     model.load_state_dict(best_state)
-    test_metrics = evaluate(model, test_loader, device)
+    test_metrics = evaluate(model, test_loader, device, is_toxin)
 
     # save best checkpoint to disk so post-hoc analysis can use it
     torch.save(best_state, out_dir / 'best_model.pth')

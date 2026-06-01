@@ -366,7 +366,8 @@ class SUCFCleanAblation(nn.Module):
         if hasattr(self, 'final_projection'):
             self.final_projection.apply(init_linear)
 
-    def forward(self, data):
+    def forward(self, data, plddt_strategy=None):
+        """plddt_strategy: None | 'scalar_weighting' | 'hard_mask' — inference-only overrides."""
         batch_index = getattr(data, 'batch', None)
 
         # === 1. Sequence Encoding ===
@@ -428,7 +429,15 @@ class SUCFCleanAblation(nn.Module):
             raw_struct_map = torch.zeros_like(seq_emb)
 
         # === 4. pLDDT Gating ===
-        if self.use_structure and self.use_plddt_gate and self.plddt_gating is not None:
+        if plddt_strategy == 'scalar_weighting':
+            plddt_norm = (data.plddt / 100.0).clamp(0.0, 1.0).unsqueeze(-1)
+            struct_map = raw_struct_map * plddt_norm
+            gate_per_residue = plddt_norm
+        elif plddt_strategy == 'hard_mask':
+            mask = (data.plddt > 70).float().unsqueeze(-1)
+            struct_map = raw_struct_map * mask
+            gate_per_residue = mask
+        elif self.use_structure and self.use_plddt_gate and self.plddt_gating is not None:
             struct_map = self.plddt_gating(
                 struct_feats=raw_struct_map,
                 seq_feats=seq_emb,
