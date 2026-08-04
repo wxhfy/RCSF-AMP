@@ -1,0 +1,32 @@
+{
+  "n_samples": 1550,
+  "n_positive": 894,
+  "n_negative": 656,
+  "threshold": 0.5,
+  "accuracy": 0.8838709677419355,
+  "auc": 0.9339328586238883,
+  "aupr": 0.9604719768592961,
+  "mcc": 0.779239800094874,
+  "f1": 0.8914354644149578,
+  "sensitivity": 0.8266219239373602,
+  "specificity": 0.961890243902439,
+  "confusion_matrix": [
+    [
+      631,
+      25
+    ],
+    [
+      155,
+      739
+    ]
+  ],
+  "model": "SSFGM-Model",
+  "checkpoint": "/home/20T-1/fyh0106/fyh/SSFGM-Model-main/example1/1114_GCN_finger1_seed32.pth",
+  "protbert_dir": "/home/20T-1/fyh0106/compare2/merged_amp_decoy/embeddings/protbert_embedding",
+  "esm_dir": "/home/20T-1/fyh0106/SUCF/baseline/SSFGM-Model/b2_test_data/esm_npy",
+  "masif_root": "/home/20T-1/fyh0106/compare2/masif_site",
+  "seed": 42,
+  "batch_size": 32,
+  "device": "cuda:0",
+  "elapsed_seconds": 52.81874656677246
+}

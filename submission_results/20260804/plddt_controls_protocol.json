@@ -1,0 +1,18 @@
+{
+  "protocol": "same_checkpoint_test_time_replacement",
+  "checkpoint": "best_model_stage_2.0.pth from true_plddt runs",
+  "seeds": [
+    32,
+    37,
+    42,
+    47,
+    52
+  ],
+  "variants": {
+    "true_plddt": "true",
+    "global_constant": "constant",
+    "within_peptide_shuffle": "shuffle_intra",
+    "no_plddt": "zero"
+  },
+  "threshold": 0.5
+}

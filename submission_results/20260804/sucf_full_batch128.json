@@ -1,0 +1,52 @@
+{
+  "model_id": "SUCF-AMP_full",
+  "config": "/home/20T-1/fyh0106/SUCF/outputs/component_ablation_strict/full_model/seed32/resolved_config.yaml",
+  "checkpoint": "/home/20T-1/fyh0106/SUCF/outputs/component_ablation_strict/full_model/seed32/checkpoints/best_model_stage_2.0.pth",
+  "batch_size": 128,
+  "warmup_iterations": 20,
+  "timed_iterations": 100,
+  "repeats": 5,
+  "total_params": 72594477,
+  "trainable_params": 72594477,
+  "post_scgc_structure_source": "calibrated_raw_residual",
+  "inference_ms_per_1000_mean": 2054.3934965790104,
+  "inference_ms_per_1000_std": 15.667081804450817,
+  "peak_gpu_memory_mb_mean": 3434.11650390625,
+  "repeats_detail": [
+    {
+      "repeat": 1,
+      "graphs": 11888,
+      "elapsed_seconds": 24.34664347814396,
+      "inference_ms_per_1000": 2048.00163847106,
+      "peak_gpu_memory_mb": 3433.53564453125
+    },
+    {
+      "repeat": 2,
+      "graphs": 11888,
+      "elapsed_seconds": 24.176715592853725,
+      "inference_ms_per_1000": 2033.707570058355,
+      "peak_gpu_memory_mb": 3433.8427734375
+    },
+    {
+      "repeat": 3,
+      "graphs": 11888,
+      "elapsed_seconds": 24.3793974108994,
+      "inference_ms_per_1000": 2050.756848157756,
+      "peak_gpu_memory_mb": 3434.18994140625
+    },
+    {
+      "repeat": 4,
+      "graphs": 11888,
+      "elapsed_seconds": 24.5605942979455,
+      "inference_ms_per_1000": 2065.9988474045676,
+      "peak_gpu_memory_mb": 3433.3701171875
+    },
+    {
+      "repeat": 5,
+      "graphs": 11888,
+      "elapsed_seconds": 24.6497986568138,
+      "inference_ms_per_1000": 2073.5025788033145,
+      "peak_gpu_memory_mb": 3435.64404296875
+    }
+  ]
+}
