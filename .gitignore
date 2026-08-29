@@ -1,33 +1,25 @@
+# Python and editor files
 *.pyc
-best_structure_config0/
-log*
-checkpoints*
-af2_batch
-*.log
-baseline
 __pycache__/
-*.pth
-*.pt
-results/
-outputs/
-embeddings/
-*_graph
-features/
+.pytest_cache/
 .vscode/
 .idea/
-tmp/
-pssm/
-hhm/
-a3m/
-runs/
-.gitignore
-*seed*.yaml
-todo*
-*.tar.gz*
-*ablation*
-*.sh
-scripts
-extend
-outputs_archive/
-.shrimp/
 
+# Local data and generated model artifacts
+data/
+embeddings/
+features/
+checkpoints/
+outputs/
+runs/
+*.pth
+*.pt
+*.npz
+*.npy
+*.log
+tmp/
+
+# Local experiment overrides
+*.local.yaml
+*.local.yml
+*.local.json

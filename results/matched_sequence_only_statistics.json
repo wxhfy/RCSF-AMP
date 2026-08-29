@@ -1,0 +1,30 @@
+{
+  "benchmark": "Benchmark 2",
+  "variant": "matched sequence-only final protocol",
+  "seeds": [32, 37, 42, 47, 52],
+  "selection": "validation AUPR",
+  "test_threshold": 0.5,
+  "structure_physically_removed": true,
+  "alignment_contrastive_loss": "inactive because the sequence-only branch has no structural representation",
+  "per_seed": {
+    "32": {"accuracy": 0.8812903226, "auc": 0.9502373547, "aupr": 0.9676097871, "f1": 0.8935185185, "mcc": 0.7621144185},
+    "37": {"accuracy": 0.8845161290, "auc": 0.9540483303, "aupr": 0.9698396172, "f1": 0.8990411732, "mcc": 0.7643222579},
+    "42": {"accuracy": 0.8819354839, "auc": 0.9531258526, "aupr": 0.9699324456, "f1": 0.8924162257, "mcc": 0.7672765184},
+    "47": {"accuracy": 0.8825806452, "auc": 0.9531309680, "aupr": 0.9694128280, "f1": 0.8946759259, "mcc": 0.7647336355},
+    "52": {"accuracy": 0.8825806452, "auc": 0.9529297621, "aupr": 0.9699228342, "f1": 0.8929411765, "mcc": 0.7687437319}
+  },
+  "mean_sd": {
+    "accuracy": {"mean": 0.8825806452, "sd": 0.001207},
+    "auc": {"mean": 0.9526944535, "sd": 0.001441},
+    "aupr": {"mean": 0.9693435024, "sd": 0.000992},
+    "f1": {"mean": 0.8945186034, "sd": 0.002664},
+    "mcc": {"mean": 0.7654381120, "sd": 0.002603}
+  },
+  "source_runs": {
+    "32": "matched_sequence_only_final_20260811/seed32",
+    "37": "matched_sequence_only_final_20260811/seed37",
+    "42": "matched_sequence_only_final_20260811/seed42",
+    "47": "matched_sequence_only_final_20260811/seed47",
+    "52": "matched_sequence_only_final_20260811/seed52"
+  }
+}

@@ -20,7 +20,7 @@ from torch_geometric.loader import DataLoader as PyGDataLoader
 from tqdm.auto import tqdm
 
 # Add project root to Python path
-project_root = Path(__file__).resolve().parent.parent
+project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
 from models.sucf_model import create_sucf_model
